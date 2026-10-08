@@ -180,13 +180,12 @@ function finishPostResponse<T extends object>(
   reportError: (operation: string, cause: unknown) => void,
 ): void {
   finishJson(res, statusCode, operation.response)
-  if (operation.afterResponse === undefined) return
+  const afterResponse = operation.afterResponse
+  if (afterResponse === undefined) return
   setImmediate(() => {
-    try {
-      operation.afterResponse?.()
-    } catch (cause) {
+    void Promise.resolve().then(afterResponse).catch((cause: unknown) => {
       reportError(`${operationName} after response`, cause)
-    }
+    })
   })
 }
 
@@ -317,6 +316,37 @@ export async function handleDesktopMarketSelectRequest(
   } catch (cause) {
     reportError('select Market provider', cause)
     finishJson(res, 500, error('Market selection could not be saved'))
+  }
+}
+
+/** Save the AA opt-in before scheduling its next Host generation. */
+export async function handleDesktopAaSelectRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  expectedOrigin: string,
+  controller: DesktopSettingsController,
+  reportError: (operation: string, cause: unknown) => void = () => {},
+): Promise<void> {
+  if (req.method !== 'POST') return finishJson(res, 405, error('method not allowed'), 'POST')
+  if (!isSameOriginLoopbackRequest(req, expectedOrigin, true)) {
+    return finishJson(res, 403, error('forbidden'))
+  }
+  const value = await parsePostBody(req, res)
+  if (value === INVALID_BODY) return
+  const request = isExactRecord(value, 'enabled') && typeof value.enabled === 'boolean' ? { enabled: value.enabled } : undefined
+  if (request === undefined) return finishJson(res, 400, error('invalid AA selection request'))
+  try {
+    const operation = await controller.selectAa(request.enabled)
+    finishPostResponse(
+      res,
+      operation.response.restartRequired ? 202 : 200,
+      operation,
+      'select AA plugin',
+      reportError,
+    )
+  } catch (cause) {
+    reportError('select AA plugin', cause)
+    finishJson(res, 500, error('AA selection could not be saved'))
   }
 }
 
@@ -464,29 +494,6 @@ export async function handleDesktopDiagnosticsExportRequest(
   } catch (cause) {
     reportError('export diagnostics', cause)
     finishJson(res, 500, error('diagnostics could not be exported'))
-  }
-}
-
-/** Open the isolated native Profile creator from an exact empty request. */
-export async function handleDesktopProfileCreateWindowRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-  expectedOrigin: string,
-  controller: DesktopSettingsController,
-  reportError: (operation: string, cause: unknown) => void = () => {},
-): Promise<void> {
-  if (req.method !== 'POST') return finishJson(res, 405, error('method not allowed'), 'POST')
-  if (!isSameOriginLoopbackRequest(req, expectedOrigin, true)) {
-    return finishJson(res, 403, error('forbidden'))
-  }
-  const value = await parsePostBody(req, res)
-  if (value === INVALID_BODY) return
-  if (!isEmptyRequest(value)) return finishJson(res, 400, error('invalid Profile creator request'))
-  try {
-    finishJson(res, 200, controller.openProfileCreator())
-  } catch (cause) {
-    reportError('open Profile creator', cause)
-    finishJson(res, 500, error('Profile creator could not be opened'))
   }
 }
 

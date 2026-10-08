@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { claimDesktopLayout } from '../src/client/layout-service.ts'
+import { installDesktopLayout } from '../src/client/layout-service.ts'
 import { applyAdvancedShell } from '../src/client/advanced-shell.ts'
 import { applyExtendedShell } from '../src/client/extended-shell.ts'
+import { DesktopLayoutState } from '../src/client/layout-state.ts'
+import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client'
 
 interface FakeStyleElement {
   id: string
@@ -51,11 +53,15 @@ function stubDocument() {
 
 function makeCtx() {
   return {
+    inject: vi.fn(),
     reflect: { provide: vi.fn(), get: vi.fn() },
     // Cordis runs effect factories eagerly during the apply walk — mirror
     // that here so registration assertions observe real calls.
     effect: vi.fn((factory: () => unknown) => factory()),
     slots: {
+      provideRoot: vi.fn((_props: unknown) => vi.fn()),
+      subscribe: vi.fn((_name: string, _listener: () => void) => vi.fn()),
+      entries: vi.fn(() => []),
       register: vi.fn(() => ({})),
       inject: vi.fn(),
     },
@@ -66,15 +72,31 @@ function makeCtx() {
 
 afterEach(() => { vi.unstubAllGlobals() })
 
-describe('claimDesktopLayout', () => {
-  it('wins ownership when nothing else registered the service', () => {
+describe('installDesktopLayout', () => {
+  it('installs ownership when no layout is registered', () => {
     const ctx = makeCtx()
     const dispose = vi.fn()
     ctx.reflect.provide.mockReturnValue(dispose)
-    const layout = { mark: 'state' }
+    const panels = new Set(['files'])
+    const layout = new DesktopLayoutState(id => panels.has(id))
 
-    expect(claimDesktopLayout(ctx as never, layout as never)).toBe(true)
+    installDesktopLayout(ctx as never, layout as never)
+    expect(ctx.reflect.get).toHaveBeenCalledWith('layout', false)
     expect(ctx.reflect.provide).toHaveBeenCalledWith('layout', layout)
+    const { hooks: { panelInfo } } = ctx.slots.provideRoot.mock.calls[0]![0] as {
+      hooks: { panelInfo: { getSnapshot(): unknown; subscribe(fn: () => void): () => void } }
+    }
+    expect(panelInfo).toBe(layout.panelInfo)
+    const changed = vi.fn()
+    const stop = panelInfo.subscribe(changed)
+    layout.selectPanel('files' as MainPanelId)
+    expect(panelInfo.getSnapshot()).toEqual({ activePanelId: 'files' })
+    panels.clear()
+    expect(ctx.slots.subscribe.mock.calls[0]![0]).toBe('main')
+    ctx.slots.subscribe.mock.calls[0]![1]()
+    expect(panelInfo.getSnapshot()).toEqual({ activePanelId: null })
+    expect(changed).toHaveBeenCalledTimes(2)
+    stop()
 
     // The disposal effect must be owned by the fiber so a later unload frees
     // the registration for whoever applies next; the factory result is what
@@ -84,127 +106,110 @@ describe('claimDesktopLayout', () => {
     expect(typeof disposer).toBe('function')
     ;(disposer as () => void)()
     expect(dispose).toHaveBeenCalled()
+    expect(ctx.slots.provideRoot.mock.results[0]!.value).toHaveBeenCalledOnce()
+    expect(ctx.slots.subscribe.mock.results[0]!.value).toHaveBeenCalledOnce()
   })
 
-  it('defers safely when another entry already owns the service', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      const ctx = makeCtx()
-      ctx.reflect.provide.mockImplementation(() => {
-        throw new Error('service "layout" has been registered at <z5>')
-      })
-      expect(claimDesktopLayout(ctx as never, {} as never)).toBe(false)
-      // Cordis starts the effect synchronously, but the failed factory never
-      // produces a disposer that could be retained by the fiber.
-      expect(ctx.effect).toHaveBeenCalledOnce()
-      expect(ctx.effect.mock.results[0]?.type).toBe('throw')
-      expect(warn).toHaveBeenCalled()
-    } finally {
-      warn.mockRestore()
+  it('registers the official sidebar command after services arrive and disposes it', () => {
+    const ctx = makeCtx()
+    const layout = new DesktopLayoutState()
+    installDesktopLayout(ctx as never, layout)
+    expect(ctx.inject).toHaveBeenCalledWith(['shortcuts', 'locale'], expect.any(Function))
+    const releaseLabels = vi.fn()
+    const releaseCommand = vi.fn()
+    const scope = {
+      effect: vi.fn((factory: () => unknown) => factory()),
+      locale: { register: vi.fn(() => releaseLabels), bind: vi.fn(() => () => 'Toggle left sidebar') },
+      shortcuts: { register: vi.fn((_command: unknown) => releaseCommand) },
     }
+    ctx.inject.mock.calls[0]![1](scope)
+    const command = scope.shortcuts.register.mock.calls[0]![0] as {
+      id: string; resolve(): { status: string; run(): void }
+    }
+    expect(command.id).toBe('sidebar.left.toggle')
+    const before = layout.getSnapshot().sidebar
+    expect(command.resolve().status).toBe('handled')
+    command.resolve().run()
+    expect(layout.getSnapshot().sidebar).not.toBe(before)
+    for (const result of scope.effect.mock.results) (result.value as () => void)()
+    expect(releaseLabels).toHaveBeenCalledOnce()
+    expect(releaseCommand).toHaveBeenCalledOnce()
   })
 
-  it('rethrows unrelated registration failures', () => {
+  it('rejects a layout already selected by another entry', () => {
+    const ctx = makeCtx()
+    ctx.reflect.get.mockReturnValue({ owner: 'third-party-layout' })
+
+    expect(() => installDesktopLayout(ctx as never, {} as never))
+      .toThrow('advanced and extended modes require exclusive layout ownership')
+    expect(ctx.effect).not.toHaveBeenCalled()
+    expect(ctx.reflect.provide).not.toHaveBeenCalled()
+  })
+
+  it('propagates registration failures', () => {
     const ctx = makeCtx()
     ctx.reflect.provide.mockImplementation(() => {
       throw new TypeError('cannot read properties of undefined')
     })
-    expect(() => claimDesktopLayout(ctx as never, {} as never)).toThrow(TypeError)
+    expect(() => installDesktopLayout(ctx as never, {} as never)).toThrow(TypeError)
   })
 })
 
 function environmentFor(mode: 'advanced' | 'extended') {
-  return { mode, platform: 'win32', material: 'off', micaSupported: false, version: '2.0.2' }
+  return { mode, platform: 'win32', material: 'off', version: '2.0.2' }
 }
 
 describe('applyAdvancedShell presentation ownership', () => {
-  it('owns presentation when the layout race is won', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      stubDocument()
-      const ctx = makeCtx()
-      ctx.reflect.provide.mockReturnValue(vi.fn())
+  it('owns presentation when the selected layout is available', () => {
+    stubDocument()
+    const ctx = makeCtx()
+    ctx.reflect.provide.mockReturnValue(vi.fn())
 
-      applyAdvancedShell(ctx as never, environmentFor('advanced') as never)
+    applyAdvancedShell(ctx as never, environmentFor('advanced') as never)
 
-      // layout service + owned styles/markers + theme presenter + root slot
-      expect(ctx.effect).toHaveBeenCalledTimes(4)
-      expect(ctx.slots.register).toHaveBeenCalledTimes(1)
-      expect(warn).not.toHaveBeenCalled()
-    } finally {
-      warn.mockRestore()
-    }
+    // layout service + owned styles/markers + theme presenter + root slot
+    expect(ctx.effect).toHaveBeenCalledTimes(4)
+    expect(ctx.slots.register).toHaveBeenCalledTimes(1)
   })
 
-  it('defers presentation to upstream when the race is lost, keeping only markers', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      const { dataset } = stubDocument()
-      const ctx = makeCtx()
-      ctx.reflect.provide.mockImplementation(() => {
-        throw new Error('service "layout" has been registered at <z5>')
-      })
+  it('rejects a conflicting layout before installing partial Desktop state', () => {
+    const { dataset } = stubDocument()
+    const ctx = makeCtx()
+    ctx.reflect.get.mockReturnValue({ owner: 'third-party-layout' })
 
-      applyAdvancedShell(ctx as never, environmentFor('advanced') as never)
+    expect(() => applyAdvancedShell(ctx as never, environmentFor('advanced') as never))
+      .toThrow('advanced and extended modes require exclusive layout ownership')
 
-      // Upstream keeps presenting: no root slot takeover, no presenter, and
-      // none of the desktop-owned chrome styles — just the mode markers,
-      // whose cleanup still runs through their own fiber effect.
-      expect(ctx.slots.register).not.toHaveBeenCalled()
-      // Failed ownership attempt plus the surviving marker effect.
-      expect(ctx.effect).toHaveBeenCalledTimes(2)
-      expect(ctx.effect.mock.results[0]?.type).toBe('throw')
-      const cleanup = ctx.effect.mock.results[1]?.value
-      expect(typeof cleanup).toBe('function')
-      ;(cleanup as () => void)()
-      expect(dataset.dshDesktopMode).toBeUndefined()
-      expect(dataset.dshDesktopPlatform).toBeUndefined()
-      expect(warn).toHaveBeenCalled()
-    } finally {
-      warn.mockRestore()
-    }
+    expect(ctx.effect).not.toHaveBeenCalled()
+    expect(ctx.slots.register).not.toHaveBeenCalled()
+    expect(dataset.dshDesktopMode).toBeUndefined()
+    expect(dataset.dshDesktopPlatform).toBeUndefined()
   })
 })
 
 describe('applyExtendedShell presentation ownership', () => {
-  it('owns the extended presentation and frames it when the race is won', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      stubDocument()
-      const ctx = makeCtx()
-      ctx.reflect.provide.mockReturnValue(vi.fn())
+  it('owns the extended presentation and frames the selected layout', () => {
+    stubDocument()
+    const ctx = makeCtx()
+    ctx.reflect.provide.mockReturnValue(vi.fn())
 
-      applyExtendedShell(ctx as never, environmentFor('extended') as never)
+    applyExtendedShell(ctx as never, environmentFor('extended') as never)
 
-      // layout + owned styles + presenter + root slot + framed chrome styles
-      expect(ctx.effect).toHaveBeenCalledTimes(5)
-      expect(ctx.slots.register).toHaveBeenCalledTimes(1)
-      expect(warn).not.toHaveBeenCalled()
-    } finally {
-      warn.mockRestore()
-    }
+    // layout + owned styles + presenter + root slot + framed chrome styles
+    expect(ctx.effect).toHaveBeenCalledTimes(5)
+    expect(ctx.slots.register).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the framed chrome but drops the owned presentation when the race is lost', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      stubDocument()
-      const ctx = makeCtx()
-      ctx.reflect.provide.mockImplementation(() => {
-        throw new Error('service "layout" has been registered at <z5>')
-      })
+  it('rejects a conflicting layout before installing the Desktop frame', () => {
+    stubDocument()
+    const ctx = makeCtx()
+    ctx.reflect.get.mockReturnValue({ owner: 'third-party-layout' })
 
-      applyExtendedShell(ctx as never, environmentFor('extended') as never)
+    expect(() => applyExtendedShell(ctx as never, environmentFor('extended') as never))
+      .toThrow('advanced and extended modes require exclusive layout ownership')
 
-      // The failed ownership attempt is followed only by the framed-chrome
-      // style effect; no second root frame is stacked over the existing one.
-      expect(ctx.effect).toHaveBeenCalledTimes(2)
-      expect(ctx.effect.mock.results[0]?.type).toBe('throw')
-      expect(ctx.slots.register).not.toHaveBeenCalled()
-      expect(ctx.slots.inject).toHaveBeenCalledTimes(1)
-      expect(warn).toHaveBeenCalled()
-    } finally {
-      warn.mockRestore()
-    }
+    expect(ctx.effect).not.toHaveBeenCalled()
+    expect(ctx.slots.register).not.toHaveBeenCalled()
+    expect(ctx.slots.inject).not.toHaveBeenCalled()
   })
 })

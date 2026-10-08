@@ -1,12 +1,13 @@
 /** Isolated native window for creating and immediately selecting a Desktop Profile. */
 
-import { BrowserWindow } from 'electron'
+import type { BrowserWindow } from 'electron'
 import { fileURLToPath } from 'node:url'
 import {
   auxiliaryWindowChromeOptions,
   auxiliaryWindowHasCustomFrame,
 } from './auxiliary-window-options.ts'
 import { revealApplication } from './electron-reveal.ts'
+import { createDesktopLocalWindow } from './local-window-policy.ts'
 import type { DesktopLocale } from './runtime.ts'
 import { desktopProfileCreateCopy } from './profile-create-copy.ts'
 
@@ -17,6 +18,8 @@ const PROFILE_CREATE_DOCUMENT = fileURLToPath(new URL('./native-ui/profile-creat
 export interface ProfileCreateWindowOptions {
   readonly locale: DesktopLocale
   readonly onSubmit: (name: string) => void | Promise<void>
+  /** Optional completion signal for explicit cancel, window close, or load failure. */
+  readonly onCancel?: () => void
 }
 
 export interface ProfileCreateAction {
@@ -45,6 +48,8 @@ export class ProfileCreateWindow {
   private window: BrowserWindow | undefined
   private busy = false
   private disposed = false
+  private accepted = false
+  private cancelNotified = false
 
   constructor(private readonly options: ProfileCreateWindowOptions) {}
 
@@ -56,8 +61,11 @@ export class ProfileCreateWindow {
     }
     this.disposed = false
     this.busy = false
+    this.accepted = false
+    this.cancelNotified = false
     const copy = desktopProfileCreateCopy(this.options.locale)
-    const window = new BrowserWindow({
+    const window = createDesktopLocalWindow({
+      partition: 'dsh-profile-create',
       title: copy.title,
       ...auxiliaryWindowChromeOptions(),
       width: 480,
@@ -68,20 +76,10 @@ export class ProfileCreateWindow {
       show: false,
       autoHideMenuBar: true,
       backgroundColor: '#202124',
-      webPreferences: {
-        contextIsolation: true,
-        nodeIntegration: false,
-        nodeIntegrationInSubFrames: false,
-        sandbox: true,
-        webSecurity: true,
-        webviewTag: false,
-        spellcheck: false,
-      },
     })
     this.window = window
     window.accessibleTitle = copy.title
     window.removeMenu()
-    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     const navigate = (event: Electron.Event, href: string): void => {
       const action = parseProfileCreateAction(href)
       event.preventDefault()
@@ -96,6 +94,7 @@ export class ProfileCreateWindow {
       // Electron destroys webContents before emitting BrowserWindow's `closed`.
       // Accessing window.webContents here can itself throw during a restart.
       if (this.window === window) this.window = undefined
+      if (!this.accepted) this.notifyCancel()
     })
     void window.loadFile(PROFILE_CREATE_DOCUMENT, {
       query: {
@@ -118,6 +117,7 @@ export class ProfileCreateWindow {
   private async handleAction(action: ProfileCreateAction): Promise<void> {
     if (this.busy || this.disposed) return
     if (action.action === 'cancel') {
+      this.notifyCancel()
       this.close()
       return
     }
@@ -126,6 +126,7 @@ export class ProfileCreateWindow {
     this.busy = true
     try {
       await this.options.onSubmit(name)
+      this.accepted = true
       this.close()
     } catch {
       this.busy = false
@@ -137,5 +138,11 @@ export class ProfileCreateWindow {
         true,
       ).catch(() => {})
     }
+  }
+
+  private notifyCancel(): void {
+    if (this.cancelNotified) return
+    this.cancelNotified = true
+    this.options.onCancel?.()
   }
 }

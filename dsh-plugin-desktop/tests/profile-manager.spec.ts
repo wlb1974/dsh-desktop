@@ -107,6 +107,11 @@ describe('desktop profile discovery', () => {
       '@deepseek-ai/dsh-web-app',
       'dsh-plugin-desktop',
     ])
+    writeProfile(home, 'embedded-desktop-beta', [
+      '@deepseek-ai/dsh-base',
+      '@deepseek-ai/dsh-web-app',
+      'dsh-plugin-desktop',
+    ])
     writeProfile(home, 'broken', 'not-an-array')
     mkdirSync(join(home, 'profiles', 'node_modules'), { recursive: true })
     const before = readFileSync(join(webDir, 'package.json'), 'utf8')
@@ -115,6 +120,12 @@ describe('desktop profile discovery', () => {
       expect.objectContaining({ name: 'broken', exists: true, webCapable: false, problem: expect.any(String) }),
       expect.objectContaining({
         name: 'embedded-desktop',
+        exists: true,
+        webCapable: false,
+        problem: expect.stringContaining('launcher-owned'),
+      }),
+      expect.objectContaining({
+        name: 'embedded-desktop-beta',
         exists: true,
         webCapable: false,
         problem: expect.stringContaining('launcher-owned'),
@@ -133,6 +144,7 @@ describe('desktop profile discovery', () => {
     expect(readdirSync(join(home, 'profiles')).sort()).toEqual([
       'broken',
       'embedded-desktop',
+      'embedded-desktop-beta',
       'headless',
       'node_modules',
       'work',
@@ -209,6 +221,23 @@ describe('desktop profile deletion', () => {
     await deleteDesktopProfile(options, 'web')
     expect(existsSync(join(home, 'profiles', 'desktop'))).toBe(false)
     expect(existsSync(join(home, 'profiles', 'web'))).toBe(false)
+  })
+
+  it('protects the persisted selection before it becomes the current generation', async () => {
+    const home = temporaryRoot()
+    const statePath = join(home, 'state', 'profiles.json')
+    writeSelection(home, statePath, {
+      version: 2,
+      active: 'work',
+    })
+    writeProfile(home, 'desktop', ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+    writeProfile(home, 'work', ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
+    const options = { home, selectionStatePath: statePath, currentProfileName: 'desktop' }
+
+    expect(canDeleteDesktopProfile(options, 'work')).toBe(false)
+    await expect(deleteDesktopProfile(options, 'work'))
+      .rejects.toThrow('selected profile "work" cannot be deleted')
+    expect(existsSync(join(home, 'profiles', 'work'))).toBe(true)
   })
 
   it('renames, cleans, and removes an inactive profile', async () => {
@@ -309,6 +338,11 @@ describe('desktop profile selection state', () => {
       '@deepseek-ai/dsh-web-app',
       'dsh-plugin-desktop',
     ])
+    writeProfile(home, 'embedded-desktop-beta', [
+      '@deepseek-ai/dsh-base',
+      '@deepseek-ai/dsh-web-app',
+      'dsh-plugin-desktop',
+    ])
 
     expect(readDesktopProfileState(statePath)).toEqual({
       version: 2,
@@ -325,6 +359,7 @@ describe('desktop profile selection state', () => {
       'must directly include @deepseek-ai/dsh-base before @deepseek-ai/dsh-web-app',
     )
     expect(() => selectDesktopProfile(statePath, home, 'embedded-desktop')).toThrow('launcher-owned')
+    expect(() => selectDesktopProfile(statePath, home, 'embedded-desktop-beta')).toThrow('launcher-owned')
     expect(() => selectDesktopProfile(statePath, home, '../outside')).toThrow()
     if (process.platform !== 'win32') {
       expect(statSync(statePath).mode & 0o777).toBe(0o600)

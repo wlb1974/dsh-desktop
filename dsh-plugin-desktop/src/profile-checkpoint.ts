@@ -28,7 +28,8 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const BIN_NAME = 'dsh-plugin-desktop'
-const MANIFEST_VERSION = 3
+const MANIFEST_VERSION = 4
+const PREVIOUS_MANIFEST_VERSION = 3
 const LEGACY_MANIFEST_VERSION = 2
 const SKIP_MARKER_VERSION = 1
 const SNAPSHOT_ROOT = 'health-snapshots'
@@ -36,6 +37,7 @@ const MANIFEST_FILENAME = 'manifest.json'
 const SKIP_MARKER_FILENAME = 'skip-next-healthy.json'
 const FILE_MODE = 0o600
 const DIRECTORY_MODE = 0o700
+const MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 const CHECK_POSIX_MODE = process.platform !== 'win32'
 const HASH_PATTERN = /^[0-9a-f]{64}$/u
 const ID_PATTERN = /^[A-Za-z0-9._:@/-]{1,256}$/u
@@ -82,6 +84,12 @@ export interface ProfileCheckpointOptions {
   readonly provider?: string
   /** Desktop product version displayed by Recovery when browsing checkpoints. */
   readonly appVersion?: string
+  /** npm package identity of the Desktop edition that captured the checkpoint. */
+  readonly desktopPackageName?: string
+  /** Release channel of the Desktop edition that captured the checkpoint. */
+  readonly releaseChannel?: DesktopProfileCheckpointReleaseChannel
+  /** DSH runtime version bundled with the Desktop edition. */
+  readonly dshVersion?: string
   readonly maxFileBytes?: Partial<Record<DesktopProfileCheckpointFilename, number>>
   readonly now?: () => number
 }
@@ -105,6 +113,8 @@ interface ProfileCheckpointManifestMetadata {
   readonly appVersion: string
 }
 
+export type DesktopProfileCheckpointReleaseChannel = 'stable' | 'beta'
+
 export interface ProfileCheckpointManifestV2 extends ProfileCheckpointManifestMetadata {
   readonly version: 2
   readonly files: readonly (ProfileCheckpointFileRecord & { readonly name: LegacyProfileCheckpointFilename })[]
@@ -115,7 +125,42 @@ export interface ProfileCheckpointManifestV3 extends ProfileCheckpointManifestMe
   readonly files: readonly ProfileCheckpointFileRecord[]
 }
 
-export type ProfileCheckpointManifest = ProfileCheckpointManifestV2 | ProfileCheckpointManifestV3
+export interface ProfileCheckpointManifestV4 extends ProfileCheckpointManifestMetadata {
+  readonly version: 4
+  readonly desktopPackageName: string
+  readonly releaseChannel: DesktopProfileCheckpointReleaseChannel
+  readonly dshVersion: string
+  readonly files: readonly ProfileCheckpointFileRecord[]
+}
+
+export type ProfileCheckpointManifest =
+  | ProfileCheckpointManifestV2
+  | ProfileCheckpointManifestV3
+  | ProfileCheckpointManifestV4
+
+/** Minimal healthy-start evidence read without opening or repairing checkpoint state. */
+export interface DesktopProfileCheckpointUsageEvidence {
+  readonly source: 'checkpoint'
+  readonly recordedAt: string
+  readonly desktopPackageName: string
+  readonly releaseChannel: DesktopProfileCheckpointReleaseChannel
+  readonly desktopVersion: string
+  readonly dshVersion?: string
+}
+
+/** Read-only result for another Desktop edition's checkpoint directory. */
+export type DesktopProfileCheckpointUsageProbe =
+  | { readonly status: 'none' }
+  | { readonly status: 'valid', readonly evidence: DesktopProfileCheckpointUsageEvidence }
+  | { readonly status: 'invalid', readonly problem: string }
+
+export interface DesktopProfileCheckpointUsageProbeOptions {
+  readonly userDataDir: string
+  readonly profileDir: string
+  readonly profileName: string
+  readonly legacyDesktopPackageName: string
+  readonly legacyReleaseChannel: DesktopProfileCheckpointReleaseChannel
+}
 
 export interface ProfileCheckpointSlot {
   readonly slotId: DesktopProfileCheckpointSlotId
@@ -205,6 +250,11 @@ function assertAppVersion(value: string): string {
   return value
 }
 
+function assertReleaseChannel(value: string): DesktopProfileCheckpointReleaseChannel {
+  if (value !== 'stable' && value !== 'beta') fail('invalid Desktop release channel')
+  return value
+}
+
 function assertSlotId(value: string): DesktopProfileCheckpointSlotId {
   if (!(DESKTOP_PROFILE_CHECKPOINT_SLOT_IDS as readonly string[]).includes(value)) fail('invalid checkpoint slot')
   return value as DesktopProfileCheckpointSlotId
@@ -262,6 +312,7 @@ function readJson(path: string): unknown {
   if (!item.isFile() || item.isSymbolicLink() || (CHECK_POSIX_MODE && (item.mode & 0o777) !== FILE_MODE)) {
     fail(`checkpoint file has unsafe type or mode: ${path}`)
   }
+  if (item.size > MANIFEST_MAX_BYTES) fail(`checkpoint file is too large: ${path}`)
   return JSON.parse(readFileSync(path, 'utf8')) as unknown
 }
 
@@ -296,8 +347,125 @@ function filePath(root: string, name: DesktopProfileCheckpointFilename): string 
 
 function checkpointFiles(version: unknown): readonly DesktopProfileCheckpointFilename[] {
   if (version === LEGACY_MANIFEST_VERSION) return LEGACY_PROFILE_CHECKPOINT_FILES
-  if (version === MANIFEST_VERSION) return DESKTOP_PROFILE_CHECKPOINT_FILES
+  if (version === PREVIOUS_MANIFEST_VERSION || version === MANIFEST_VERSION) return DESKTOP_PROFILE_CHECKPOINT_FILES
   fail('checkpoint manifest is invalid')
+}
+
+/**
+ * Read the newest healthy-start identity without creating directories, rotating
+ * slots, recovering interrupted writes, or reading snapshotted Profile files.
+ */
+export function inspectLatestDesktopProfileCheckpointUsage(
+  options: DesktopProfileCheckpointUsageProbeOptions,
+): DesktopProfileCheckpointUsageProbe {
+  let userDataDir: string
+  let profileDir: string
+  let profileName: string
+  let legacyPackageName: string
+  let legacyChannel: DesktopProfileCheckpointReleaseChannel
+  try {
+    userDataDir = assertAbsolute('userDataDir', options.userDataDir)
+    profileDir = assertAbsolute('profileDir', options.profileDir)
+    profileName = assertProfileName(options.profileName)
+    legacyPackageName = assertIdentifier('Desktop package name', options.legacyDesktopPackageName)
+    legacyChannel = assertReleaseChannel(options.legacyReleaseChannel)
+  } catch (cause) {
+    return { status: 'invalid', problem: cause instanceof Error ? cause.message : String(cause) }
+  }
+
+  const profileIdentity = hash(profileDir)
+  const snapshotRoot = join(userDataDir, SNAPSHOT_ROOT)
+  const profileRoot = join(snapshotRoot, hash(profileIdentity))
+  try {
+    const userData = lstatSync(userDataDir)
+    if (!userData.isDirectory() || userData.isSymbolicLink()) fail('userDataDir must be a real directory')
+    const snapshots = lstatSync(snapshotRoot)
+    if (!snapshots.isDirectory() || snapshots.isSymbolicLink()
+      || (CHECK_POSIX_MODE && (snapshots.mode & 0o777) !== DIRECTORY_MODE)) {
+      fail('checkpoint root has unsafe type or mode')
+    }
+    const root = lstatSync(profileRoot)
+    if (!root.isDirectory() || root.isSymbolicLink()
+      || (CHECK_POSIX_MODE && (root.mode & 0o777) !== DIRECTORY_MODE)) {
+      fail('checkpoint directory has unsafe type or mode')
+    }
+  } catch (cause) {
+    if (isENOENT(cause)) return { status: 'none' }
+    return { status: 'invalid', problem: cause instanceof Error ? cause.message : String(cause) }
+  }
+
+  let latest: DesktopProfileCheckpointUsageEvidence | undefined
+  try {
+    for (const slotId of DESKTOP_PROFILE_CHECKPOINT_SLOT_IDS) {
+      const directory = join(profileRoot, slotId)
+      let directoryItem
+      try { directoryItem = lstatSync(directory) } catch (cause) {
+        if (isENOENT(cause)) continue
+        throw cause
+      }
+      if (!directoryItem.isDirectory() || directoryItem.isSymbolicLink()
+        || (CHECK_POSIX_MODE && (directoryItem.mode & 0o777) !== DIRECTORY_MODE)) {
+        fail('checkpoint directory has unsafe type or mode')
+      }
+      const value = readJson(join(directory, MANIFEST_FILENAME))
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) fail('checkpoint manifest is invalid')
+      const object = value as Record<string, unknown>
+      const expectedFiles = checkpointFiles(object.version)
+      if (typeof object.snapshotId !== 'string' || !ID_PATTERN.test(object.snapshotId)
+        || typeof object.capturedAt !== 'string' || !Number.isFinite(Date.parse(object.capturedAt))
+        || new Date(Date.parse(object.capturedAt)).toISOString() !== object.capturedAt
+        || object.profileIdentity !== profileIdentity || object.profileName !== profileName
+        || object.slotId !== slotId || object.reason !== 'healthy-startup'
+        || typeof object.provider !== 'string'
+        || assertIdentifier('checkpoint provider', object.provider) !== object.provider
+        || typeof object.appVersion !== 'string' || assertAppVersion(object.appVersion) !== object.appVersion
+        || !Array.isArray(object.files) || object.files.length !== expectedFiles.length) {
+        fail('checkpoint metadata is invalid')
+      }
+      for (let index = 0; index < expectedFiles.length; index += 1) {
+        const record = object.files[index]
+        const expected = expectedFiles[index]!
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+          fail('checkpoint manifest is invalid')
+        }
+        const item = record as Record<string, unknown>
+        if (item.name !== expected || typeof item.present !== 'boolean') fail('checkpoint manifest is invalid')
+        if (item.present && (typeof item.sha256 !== 'string' || !HASH_PATTERN.test(item.sha256)
+          || !Number.isSafeInteger(item.size) || (item.size as number) < 0 || (item.size as number) > FILE_LIMITS[expected]
+          || !Number.isSafeInteger(item.mode) || (item.mode as number) < 0 || (item.mode as number) > 0o777)) {
+          fail('checkpoint manifest is invalid')
+        }
+      }
+      let desktopPackageName = legacyPackageName
+      let releaseChannel = legacyChannel
+      let dshVersion: string | undefined
+      if (object.version === MANIFEST_VERSION) {
+        if (typeof object.desktopPackageName !== 'string'
+          || assertIdentifier('Desktop package name', object.desktopPackageName) !== legacyPackageName
+          || typeof object.releaseChannel !== 'string'
+          || typeof object.dshVersion !== 'string') {
+          fail('checkpoint Desktop identity is invalid')
+        }
+        const manifestChannel = assertReleaseChannel(object.releaseChannel)
+        if (manifestChannel !== legacyChannel) fail('checkpoint Desktop identity is invalid')
+        desktopPackageName = object.desktopPackageName
+        releaseChannel = manifestChannel
+        dshVersion = assertAppVersion(object.dshVersion)
+      }
+      const evidence: DesktopProfileCheckpointUsageEvidence = Object.freeze({
+        source: 'checkpoint',
+        recordedAt: object.capturedAt,
+        desktopPackageName,
+        releaseChannel,
+        desktopVersion: object.appVersion,
+        ...(dshVersion === undefined ? {} : { dshVersion }),
+      })
+      if (latest === undefined || Date.parse(evidence.recordedAt) > Date.parse(latest.recordedAt)) latest = evidence
+    }
+    return latest === undefined ? { status: 'none' } : { status: 'valid', evidence: latest }
+  } catch (cause) {
+    return { status: 'invalid', problem: cause instanceof Error ? cause.message : String(cause) }
+  }
 }
 
 function targetPath(
@@ -334,6 +502,9 @@ export class DesktopProfileCheckpoint {
   readonly profileName: string
   readonly provider: string
   readonly appVersion: string
+  readonly desktopPackageName: string
+  readonly releaseChannel: DesktopProfileCheckpointReleaseChannel
+  readonly dshVersion: string
   readonly profileRoot: string
 
   private readonly limits: Record<DesktopProfileCheckpointFilename, number>
@@ -350,6 +521,9 @@ export class DesktopProfileCheckpoint {
     this.profileName = assertProfileName(options.profileName ?? 'desktop')
     this.provider = assertIdentifier('provider', options.provider ?? 'unknown')
     this.appVersion = assertAppVersion(options.appVersion ?? 'unknown')
+    this.desktopPackageName = assertIdentifier('Desktop package name', options.desktopPackageName ?? 'dsh-plugin-desktop')
+    this.releaseChannel = assertReleaseChannel(options.releaseChannel ?? 'stable')
+    this.dshVersion = assertAppVersion(options.dshVersion ?? 'unknown')
     this.now = options.now ?? Date.now
     this.limits = { ...FILE_LIMITS, ...(options.maxFileBytes ?? {}) }
     for (const name of DESKTOP_PROFILE_CHECKPOINT_FILES) {
@@ -419,7 +593,7 @@ export class DesktopProfileCheckpoint {
           writeDurable(destination, readFileSync(targetPath(this.profileDir, this.homeDir, name)))
         }
       }
-      const manifest: ProfileCheckpointManifestV3 = {
+      const manifest: ProfileCheckpointManifestV4 = {
         version: MANIFEST_VERSION,
         snapshotId,
         capturedAt: new Date(this.now()).toISOString(),
@@ -429,6 +603,9 @@ export class DesktopProfileCheckpoint {
         slotId: target.slotId,
         reason: 'healthy-startup',
         appVersion: this.appVersion,
+        desktopPackageName: this.desktopPackageName,
+        releaseChannel: this.releaseChannel,
+        dshVersion: this.dshVersion,
         files: records,
       }
       writeDurable(join(staging, MANIFEST_FILENAME), Buffer.from(`${JSON.stringify(manifest)}\n`, 'utf8'))
@@ -648,6 +825,15 @@ export class DesktopProfileCheckpoint {
         || typeof object.appVersion !== 'string' || assertAppVersion(object.appVersion) !== object.appVersion) {
         fail('checkpoint metadata is invalid')
       }
+      if (object.version === MANIFEST_VERSION
+        && (typeof object.desktopPackageName !== 'string'
+          || assertIdentifier('Desktop package name', object.desktopPackageName) !== object.desktopPackageName
+          || typeof object.releaseChannel !== 'string'
+          || assertReleaseChannel(object.releaseChannel) !== object.releaseChannel
+          || typeof object.dshVersion !== 'string'
+          || assertAppVersion(object.dshVersion) !== object.dshVersion)) {
+        fail('checkpoint Desktop identity is invalid')
+      }
       for (let index = 0; index < expectedFiles.length; index += 1) {
         const record = files[index]
         const expected = expectedFiles[index]!
@@ -689,7 +875,12 @@ export function createDesktopProfileCheckpoint(options: ProfileCheckpointOptions
 
 /** Remove all three slots and the skip marker for one deleted Profile. */
 export function clearDesktopProfileCheckpoint(userDataDir: string, profileDir: string): void {
-  const userData = realDirectory('userDataDir', userDataDir)
+  const absoluteUserData = assertAbsolute('userDataDir', userDataDir)
+  try { lstatSync(absoluteUserData) } catch (cause) {
+    if (isENOENT(cause)) return
+    throw cause
+  }
+  const userData = realDirectory('userDataDir', absoluteUserData)
   const profile = assertAbsolute('profileDir', profileDir)
   const profileRoot = join(userData, SNAPSHOT_ROOT, hash(hash(profile)))
   let item

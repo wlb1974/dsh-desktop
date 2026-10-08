@@ -31,6 +31,7 @@ describe('desktop profiles Host plugin', () => {
         { name: '工作 profile', dir: '/profiles/work', exists: true, bundles: [], webCapable: true },
         { name: 'headless', dir: '/profiles/headless', exists: true, bundles: [], webCapable: false },
       ],
+      prepareSelection: async () => ({ restartRequired: true, restart: async () => {} }),
       select: async selected => { events.push(`select:${selected}`) },
       canDelete: () => false,
       delete: async () => {},

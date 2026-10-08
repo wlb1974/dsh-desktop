@@ -11,10 +11,11 @@ interface DesktopDialogState {
   readonly title: string
   readonly message: string
   readonly detail?: string
+  readonly advisory?: string
   readonly buttons: readonly string[]
   readonly defaultId: number
   readonly cancelId: number
-  readonly presentation?: 'default' | 'diagnostic'
+  readonly presentation?: 'default' | 'diagnostic' | 'profile-compatibility'
 }
 
 function decodeState(): DesktopDialogState | undefined {
@@ -37,7 +38,22 @@ function respond(response: number): void {
   window.location.assign(url.href)
 }
 
-function ToneIcon({ type }: Pick<DesktopDialogState, 'type'>): JSX.Element {
+export function desktopDialogShowsToneIcon(presentation: DesktopDialogState['presentation']): boolean {
+  return presentation !== 'profile-compatibility'
+}
+
+export function desktopDialogButtonClassName(
+  presentation: DesktopDialogState['presentation'],
+  index: number,
+): string | undefined {
+  return presentation === 'profile-compatibility' && index === 0 ? 'mr-auto' : undefined
+}
+
+export function desktopDialogAdvisoryLines(advisory: string): readonly string[] {
+  return advisory.split('\n')
+}
+
+export function DesktopDialogToneIcon({ type }: Pick<DesktopDialogState, 'type'>): JSX.Element {
   const className = type === 'error'
     ? 'text-destructive'
     : type === 'warning'
@@ -62,22 +78,35 @@ export function DesktopDialogApp(): JSX.Element {
 
   if (state === undefined) return <><DesktopFrame /><main className="dshNativeContent flex items-center justify-center p-5"><p className="text-sm text-destructive">Desktop dialog state is unavailable.</p></main></>
   const diagnostic = state.presentation === 'diagnostic'
+  const profileCompatibility = state.presentation === 'profile-compatibility'
+  const showToneIcon = desktopDialogShowsToneIcon(state.presentation)
+  const describedBy = [
+    ...(state.detail === undefined ? [] : ['desktop-dialog-detail']),
+    ...(state.advisory === undefined ? [] : ['desktop-dialog-advisory']),
+  ].join(' ') || undefined
   return <><DesktopFrame /><main className="dshNativeContent flex flex-col p-5">
-    <section className="flex gap-4" role="dialog" aria-labelledby="desktop-dialog-title" aria-describedby={state.detail === undefined ? undefined : 'desktop-dialog-detail'}>
-      <div className="mt-0.5 shrink-0"><ToneIcon type={state.type} /></div>
+    <section className="flex gap-4" role="dialog" aria-labelledby="desktop-dialog-title" aria-describedby={describedBy}>
+      {showToneIcon ? <div className="mt-0.5 shrink-0"><DesktopDialogToneIcon type={state.type} /></div> : null}
       <div className="min-w-0 flex-1">
         <h1 className="text-base font-semibold leading-tight" id="desktop-dialog-title">{state.message}</h1>
         {state.detail === undefined
           ? null
+          : profileCompatibility
+            ? <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground" id="desktop-dialog-detail">{state.detail}</p>
           : diagnostic
             ? <ScrollArea className="mt-3 h-64 rounded-lg border bg-muted/40">
                 <pre className="select-text whitespace-pre-wrap break-words p-3 font-mono text-xs leading-relaxed text-muted-foreground" id="desktop-dialog-detail">{state.detail}</pre>
               </ScrollArea>
-            : <p className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground" id="desktop-dialog-detail">{state.detail}</p>}
+            : <ScrollArea className="mt-2 h-28 pr-3">
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground" id="desktop-dialog-detail">{state.detail}</p>
+              </ScrollArea>}
+        {state.advisory === undefined ? null : <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-sm leading-relaxed text-amber-900 dark:text-amber-100" id="desktop-dialog-advisory">
+          {desktopDialogAdvisoryLines(state.advisory).map((line, index) => <span className="block" key={`${String(index)}:${line}`}>{line}</span>)}
+        </div>}
       </div>
     </section>
     <footer className="mt-5 flex shrink-0 flex-wrap justify-end gap-2">
-      {state.buttons.map((label, index) => <Button autoFocus={index === state.defaultId} key={`${String(index)}:${label}`} onClick={() => { respond(index) }} type="button" variant={index === state.defaultId ? 'default' : index === state.cancelId ? 'outline' : 'secondary'}>{label}</Button>)}
+      {state.buttons.map((label, index) => <Button autoFocus={index === state.defaultId} className={desktopDialogButtonClassName(state.presentation, index)} key={`${String(index)}:${label}`} onClick={() => { respond(index) }} type="button" variant={index === state.defaultId ? 'default' : index === state.cancelId ? 'outline' : 'secondary'}>{label}</Button>)}
     </footer>
   </main></>
 }

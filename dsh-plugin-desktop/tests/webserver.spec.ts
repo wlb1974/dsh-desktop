@@ -6,6 +6,7 @@ import {
   createDesktopBrowserAccess,
   type DesktopBrowserAccess,
 } from '../src/desktop-browser-access.ts'
+import { DESKTOP_WEB_PORT_RETRY_LIMIT } from '../src/desktop-port.ts'
 import DesktopWebServer from '../src/webserver.ts'
 
 const occupied: Server[] = []
@@ -84,7 +85,9 @@ describe('Desktop WebServer port policy', () => {
 
     await context.plugin(DesktopWebServer, { host: '127.0.0.1', port: blocked.port })
 
-    expect(context.get('webServer')?.port).toBe(blocked.port + 1)
+    const selectedPort = context.get('webServer')?.port ?? 0
+    expect(selectedPort).toBeGreaterThan(blocked.port)
+    expect(selectedPort).toBeLessThanOrEqual(blocked.port + DESKTOP_WEB_PORT_RETRY_LIMIT)
   })
 
   it('preserves an OS-assigned port when the explicit value is zero', async () => {

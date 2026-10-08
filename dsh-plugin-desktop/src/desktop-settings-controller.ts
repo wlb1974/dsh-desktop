@@ -11,7 +11,6 @@ import type {
   DesktopDeveloperToolsToggleResponse,
   DesktopDiagnosticsExportResponse,
   DesktopProfileCreateResponse,
-  DesktopProfileCreateWindowResponse,
   DesktopProfileDeleteResponse,
   DesktopProfileSelectResponse,
   DesktopRestartResponse,
@@ -27,11 +26,11 @@ import type {
 /** Launcher capabilities used without exposing their filesystem roots. */
 export interface DesktopSettingsControllerBootstrap {
   /** Generation-scoped profile service. */
-  readonly profiles: Pick<DesktopProfiles, 'current' | 'list' | 'create'>
+  readonly profiles: Pick<DesktopProfiles, 'current' | 'list' | 'create' | 'prepareSelection'>
     & Partial<Pick<DesktopProfiles, 'canDelete' | 'delete'>>
-  /** Persist one already-validated profile as pending without restarting. */
-  persistProfileSelection(name: string): void | Promise<void>
   /** Read the latest persisted request and the startup-effective provider. */
+  readAa?(): { readonly requested: boolean; readonly effective: boolean }
+  selectAa?(enabled: boolean): Promise<void>
   readMarket(): DesktopMarketSnapshot
   /** Persist an explicit provider request. */
   selectMarket(provider: DesktopMarketProvider): Promise<DesktopMarketSnapshot>
@@ -49,14 +48,12 @@ export interface DesktopSettingsControllerBootstrap {
   toggleDeveloperTools(): void
   /** Export diagnostics through the launcher-owned privacy flow. */
   exportDiagnostics(): void | Promise<void>
-  /** Open the isolated native Profile creator. */
-  openProfileCreator(): void
 }
 
 /** A persisted response plus work that must run only after `res.end()`. */
 export interface DesktopSettingsPostResponse<T extends object> {
   readonly response: T
-  readonly afterResponse?: () => void
+  readonly afterResponse?: () => void | Promise<void>
 }
 
 /** Remove paths, bundle identities, and parser diagnostics from a profile. */
@@ -109,6 +106,7 @@ export class DesktopSettingsController {
           this.bootstrap.profiles.canDelete?.(profile.name) ?? false,
         )),
       ),
+      aa: Object.freeze(this.bootstrap.readAa?.() ?? { requested: false, effective: false }),
       market: projectMarket(this.bootstrap.readMarket(), this.effectiveMarket),
       web: Object.freeze({
         localUrl: web.localUrl,
@@ -140,17 +138,10 @@ export class DesktopSettingsController {
   async selectProfile(
     name: string,
   ): Promise<DesktopSettingsPostResponse<DesktopProfileSelectResponse>> {
-    const restartRequired = name !== this.bootstrap.profiles.current.name
-    if (restartRequired) {
-      const profile = this.bootstrap.profiles.list().find(candidate => candidate.name === name)
-      if (profile === undefined || !profile.webCapable || profile.problem !== undefined) {
-        throw new Error(`dsh-plugin-desktop: profile ${JSON.stringify(name)} is not selectable`)
-      }
-      await this.bootstrap.persistProfileSelection(name)
-    }
+    const selection = await this.bootstrap.profiles.prepareSelection(name)
     return Object.freeze({
-      response: Object.freeze({ accepted: true, restartRequired }),
-      ...(restartRequired ? { afterResponse: () => { this.bootstrap.scheduleRestart() } } : {}),
+      response: Object.freeze({ accepted: true, restartRequired: selection.restartRequired }),
+      ...(selection.restartRequired ? { afterResponse: () => selection.restart() } : {}),
     })
   }
 
@@ -160,6 +151,16 @@ export class DesktopSettingsController {
   ): Promise<DesktopSettingsPostResponse<DesktopMarketSelectResponse>> {
     await this.bootstrap.selectMarket(provider)
     const restartRequired = provider !== this.effectiveMarket
+    return Object.freeze({
+      response: Object.freeze({ accepted: true, restartRequired }),
+      ...(restartRequired ? { afterResponse: () => { this.bootstrap.scheduleRestart() } } : {}),
+    })
+  }
+
+  async selectAa(enabled: boolean): Promise<DesktopSettingsPostResponse<DesktopMarketSelectResponse>> {
+    if (!this.bootstrap.selectAa || !this.bootstrap.readAa) throw new Error('AA selection is unavailable')
+    await this.bootstrap.selectAa(enabled)
+    const restartRequired = enabled !== this.bootstrap.readAa().effective
     return Object.freeze({
       response: Object.freeze({ accepted: true, restartRequired }),
       ...(restartRequired ? { afterResponse: () => { this.bootstrap.scheduleRestart() } } : {}),
@@ -207,13 +208,6 @@ export class DesktopSettingsController {
     await this.bootstrap.exportDiagnostics()
     return Object.freeze({ accepted: true })
   }
-
-  /** Open the native creator that creates, selects, and restarts safely. */
-  openProfileCreator(): DesktopProfileCreateWindowResponse {
-    this.bootstrap.openProfileCreator()
-    return Object.freeze({ accepted: true })
-  }
-
 }
 
 declare module '@deepseek-ai/cordis' {

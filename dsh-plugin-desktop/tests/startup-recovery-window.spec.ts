@@ -10,9 +10,14 @@ import {
   type DesktopStartupRecoveryScreenApi,
 } from '../src/startup-recovery-window.ts'
 
+const electronDialog = vi.hoisted(() => ({
+  showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] as string[] })),
+}))
+
 vi.mock('electron', () => ({
   app: {},
   BrowserWindow: class {},
+  dialog: electronDialog,
   screen: {},
   shell: {},
 }))
@@ -107,7 +112,7 @@ describe('Desktop startup recovery confirmations', () => {
 
     expect(desktopDialog.showDetailed).toHaveBeenCalledWith(expect.objectContaining({
       type: 'error',
-      title: '回滚失败',
+      title: '未能恢复检查点',
       presentation: 'diagnostic',
       buttons: ['关闭'],
       detail: expect.stringContaining('ERR_PNPM_OUTDATED_LOCKFILE'),
@@ -216,6 +221,330 @@ describe('Desktop startup recovery confirmations', () => {
     ) as { readonly notice?: unknown })
     expect(states[0]!.notice).toEqual({ tone: 'success', title: 'slot-1', body: 'restored' })
     expect(states[1]!.notice).toBeUndefined()
+  })
+
+  it('refreshes and marks restart ready after the Profile creator selects a new Profile', async () => {
+    let selected = 'desktop'
+    const profileActions = {
+      token: 'profile-action-token',
+      list: () => ['desktop', 'fresh'].map(name => ({
+        name,
+        current: name === selected,
+        selectable: true,
+      })),
+      switchProfile: vi.fn(),
+      openCreator: vi.fn(async () => { selected = 'fresh' }),
+    }
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'zh',
+      failureStage: 'profile-selection',
+      failureDetail: 'Profile compatibility warning',
+      profileActions,
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const loadFile = vi.fn(async (
+      _path: string,
+      _options: { readonly query: { readonly state: string } },
+    ) => {})
+    const privateRecovery = recovery as unknown as {
+      window: { isDestroyed(): boolean; loadFile: typeof loadFile }
+      profiles: ReturnType<typeof profileActions.list>
+      handleAction(action: { readonly action: string }): Promise<void>
+    }
+    privateRecovery.window = { isDestroyed: () => false, loadFile }
+    privateRecovery.profiles = profileActions.list()
+
+    await privateRecovery.handleAction({ action: 'open-profile-creator' })
+
+    const state = JSON.parse(Buffer.from(loadFile.mock.calls.at(-1)![1].query.state, 'base64url').toString('utf8')) as {
+      readonly restartReady: boolean
+      readonly profiles: readonly { readonly name: string; readonly current: boolean }[]
+    }
+    expect(profileActions.openCreator).toHaveBeenCalledOnce()
+    expect(state.restartReady).toBe(true)
+    expect(state.profiles.find(profile => profile.current)?.name).toBe('fresh')
+  })
+
+  it('prepares Safe Mode only after confirmation and settles for a Safe Mode relaunch', async () => {
+    desktopDialog.show.mockClear()
+    const enterSafeMode = vi.fn()
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'zh',
+      failureStage: 'profile-composition',
+      failureDetail: 'safe mode test',
+      enterSafeMode,
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const loadFile = vi.fn(async (
+      _path: string,
+      _options: { readonly query: { readonly state: string } },
+    ) => {})
+    const parent = { isDestroyed: () => false, loadFile }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      handleAction(action: { readonly action: string }): Promise<void>
+      finish(result: 'restart' | 'safe-mode' | 'quit'): void
+    }
+    privateRecovery.window = parent
+    const finish = vi.spyOn(privateRecovery, 'finish')
+
+    await privateRecovery.handleAction({ action: 'enter-safe-mode' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      title: '进入安全模式？',
+      buttons: ['重启到安全模式', '取消'],
+      defaultId: 1,
+      cancelId: 1,
+    }), parent)
+    expect(enterSafeMode).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledWith('safe-mode')
+    const state = JSON.parse(Buffer.from(loadFile.mock.calls[0]![1].query.state, 'base64url').toString('utf8')) as {
+      readonly activeTab: string
+      readonly safeModeAvailable?: boolean
+    }
+    expect(state.activeTab).toBe('quick')
+    expect(state.safeModeAvailable).toBe(true)
+  })
+
+  it('requires confirmation before revealing the data-directory editor', async () => {
+    desktopDialog.show.mockClear()
+    const dataActions = {
+      currentDirectory: '/Users/example/.dsh',
+      usingDefaultDirectory: false,
+      defaultDirectoryMissing: vi.fn(() => false),
+      changeDirectory: vi.fn(),
+      restoreDefaultDirectory: vi.fn(),
+      resetDirectory: vi.fn(),
+    }
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'zh',
+      failureStage: 'profile-composition',
+      failureDetail: 'data directory test',
+      dataActions,
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const loadFile = vi.fn(async (
+      _path: string,
+      _options: { readonly query: { readonly state: string } },
+    ) => {})
+    const parent = { isDestroyed: () => false, loadFile }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      handleAction(action: { readonly action: string }): Promise<void>
+    }
+    privateRecovery.window = parent
+
+    await privateRecovery.handleAction({ action: 'begin-change-data-directory' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      title: '更改数据目录？',
+      detail: '请选择空文件夹或已有的 DSH 数据目录。空文件夹将用于创建新环境；原数据目录会保留。',
+      buttons: ['选择目录', '取消'],
+      defaultId: 1,
+      cancelId: 1,
+    }), parent)
+    const encoded = loadFile.mock.calls.at(-1)![1]
+    const state = JSON.parse(Buffer.from(encoded.query.state, 'base64url').toString('utf8')) as {
+      readonly activeTab: string
+      readonly dataDirectory: { readonly currentDirectory: string; readonly editing: boolean }
+    }
+    expect(state.activeTab).toBe('data')
+    expect(state.dataDirectory).toEqual({
+      currentDirectory: '/Users/example/.dsh',
+      usingDefaultDirectory: false,
+      editing: true,
+    })
+    expect(dataActions.changeDirectory).not.toHaveBeenCalled()
+  })
+
+  it('uses the Electron directory picker and changes only to an explicitly submitted path', async () => {
+    electronDialog.showOpenDialog.mockClear()
+    electronDialog.showOpenDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePaths: ['/Volumes/Data/DSH'],
+    })
+    const changeDirectory = vi.fn(async (
+      _path: string,
+      signal: AbortSignal,
+    ) => {
+      expect(signal.aborted).toBe(false)
+    })
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'en',
+      failureStage: 'profile-composition',
+      failureDetail: 'data directory selection test',
+      dataActions: {
+        currentDirectory: '/Users/example/.dsh',
+        usingDefaultDirectory: false,
+        defaultDirectoryMissing: vi.fn(() => false),
+        changeDirectory,
+        restoreDefaultDirectory: vi.fn(),
+        resetDirectory: vi.fn(),
+      },
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const loadFile = vi.fn(async () => {})
+    const parent = { isDestroyed: () => false, loadFile }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      dataDirectoryEditing: boolean
+      handleAction(action: { readonly action: string; readonly path?: string }): Promise<void>
+      finish(result: 'restart' | 'safe-mode' | 'quit'): void
+    }
+    privateRecovery.window = parent
+    privateRecovery.dataDirectoryEditing = true
+    const finish = vi.spyOn(privateRecovery, 'finish').mockImplementation(() => {})
+
+    await privateRecovery.handleAction({ action: 'browse-data-directory' })
+    expect(electronDialog.showOpenDialog).toHaveBeenCalledWith(parent, expect.objectContaining({
+      title: 'Select a DSH data directory',
+      properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+    }))
+    expect(changeDirectory).not.toHaveBeenCalled()
+
+    await privateRecovery.handleAction({ action: 'apply-data-directory', path: '/Volumes/Data/DSH' })
+    expect(changeDirectory).toHaveBeenCalledWith(
+      '/Volumes/Data/DSH',
+      expect.any(AbortSignal),
+    )
+    expect(finish).toHaveBeenCalledWith('restart')
+  })
+
+  it('restores the platform-default data directory only after confirmation and then restarts', async () => {
+    desktopDialog.show.mockClear()
+    const restoreDefaultDirectory = vi.fn(async (signal: AbortSignal) => {
+      expect(signal.aborted).toBe(false)
+    })
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'zh',
+      failureStage: 'profile-composition',
+      failureDetail: 'restore default data directory test',
+      dataActions: {
+        currentDirectory: '/Volumes/Data/DSH',
+        usingDefaultDirectory: false,
+        defaultDirectoryMissing: vi.fn(() => false),
+        changeDirectory: vi.fn(),
+        restoreDefaultDirectory,
+        resetDirectory: vi.fn(),
+      },
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const parent = { isDestroyed: () => false, loadFile: vi.fn(async () => {}) }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      handleAction(action: { readonly action: string }): Promise<void>
+      finish(result: 'restart' | 'safe-mode' | 'quit'): void
+    }
+    privateRecovery.window = parent
+    const finish = vi.spyOn(privateRecovery, 'finish').mockImplementation(() => {})
+
+    desktopDialog.show.mockResolvedValueOnce({ response: 1, checkboxChecked: false })
+    await privateRecovery.handleAction({ action: 'restore-default-data-directory' })
+    expect(restoreDefaultDirectory).not.toHaveBeenCalled()
+    expect(finish).not.toHaveBeenCalled()
+
+    await privateRecovery.handleAction({ action: 'restore-default-data-directory' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'question',
+      title: '恢复默认数据目录？',
+      message: '切换到系统默认数据目录并重启？',
+      detail: 'DSH Desktop 将改为使用当前系统的默认数据目录。当前数据目录不会被删除。',
+      buttons: ['恢复默认并重启', '取消'],
+      defaultId: 1,
+      cancelId: 1,
+    }), parent)
+    expect(restoreDefaultDirectory).toHaveBeenCalledWith(expect.any(AbortSignal), false)
+    expect(finish).toHaveBeenCalledWith('restart')
+  })
+
+  it('asks to create a new environment when the platform-default directory was deleted', async () => {
+    desktopDialog.show.mockClear()
+    const defaultDirectoryMissing = vi.fn(() => true)
+    const restoreDefaultDirectory = vi.fn(async (
+      signal: AbortSignal,
+      createIfMissing: boolean,
+    ) => {
+      expect(signal.aborted).toBe(false)
+      expect(createIfMissing).toBe(true)
+    })
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'zh',
+      failureStage: 'profile-composition',
+      failureDetail: 'missing default data directory test',
+      dataActions: {
+        currentDirectory: '/Volumes/Data/DSH',
+        usingDefaultDirectory: false,
+        defaultDirectoryMissing,
+        changeDirectory: vi.fn(),
+        restoreDefaultDirectory,
+        resetDirectory: vi.fn(),
+      },
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const parent = { isDestroyed: () => false, loadFile: vi.fn(async () => {}) }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      handleAction(action: { readonly action: string }): Promise<void>
+      finish(result: 'restart' | 'safe-mode' | 'quit'): void
+    }
+    privateRecovery.window = parent
+    const finish = vi.spyOn(privateRecovery, 'finish').mockImplementation(() => {})
+
+    await privateRecovery.handleAction({ action: 'restore-default-data-directory' })
+
+    expect(defaultDirectoryMissing).toHaveBeenCalledOnce()
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'question',
+      title: '新建默认数据目录？',
+      message: '默认数据目录不存在，是否新建？',
+      detail: 'DSH Desktop 将在默认路径创建一个全新的环境并重启。当前数据目录不会被删除。',
+      buttons: ['新建并重启', '取消'],
+      defaultId: 1,
+      cancelId: 1,
+    }), parent)
+    expect(restoreDefaultDirectory).toHaveBeenCalledWith(expect.any(AbortSignal), true)
+    expect(finish).toHaveBeenCalledWith('restart')
+  })
+
+  it('factory-resets the exact displayed directory only after destructive confirmation', async () => {
+    desktopDialog.show.mockClear()
+    const resetDirectory = vi.fn(async () => {})
+    const recovery = new DesktopStartupRecoveryWindow({
+      locale: 'en',
+      failureStage: 'profile-composition',
+      failureDetail: 'factory reset test',
+      dataActions: {
+        currentDirectory: 'C:\\Users\\Example\\.dsh',
+        usingDefaultDirectory: false,
+        defaultDirectoryMissing: vi.fn(() => false),
+        changeDirectory: vi.fn(),
+        restoreDefaultDirectory: vi.fn(),
+        resetDirectory,
+      },
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const parent = { isDestroyed: () => false, loadFile: vi.fn(async () => {}) }
+    const privateRecovery = recovery as unknown as {
+      window: typeof parent
+      handleAction(action: { readonly action: string }): Promise<void>
+      finish(result: 'restart' | 'safe-mode' | 'quit'): void
+    }
+    privateRecovery.window = parent
+    const finish = vi.spyOn(privateRecovery, 'finish').mockImplementation(() => {})
+
+    await privateRecovery.handleAction({ action: 'factory-reset' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'warning',
+      title: 'Factory reset DSH Desktop?',
+      detail: expect.stringContaining('C:\\Users\\Example\\.dsh'),
+      buttons: ['Reset data and restart', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+    }), parent)
+    expect(resetDirectory).toHaveBeenCalledOnce()
+    expect(finish).toHaveBeenCalledWith('restart')
   })
 })
 
@@ -395,6 +724,12 @@ describe('Desktop startup recovery action parser', () => {
       'open-profile-directory',
       'open-terminal',
       'open-profile-creator',
+      'enter-safe-mode',
+      'begin-change-data-directory',
+      'restore-default-data-directory',
+      'cancel-change-data-directory',
+      'browse-data-directory',
+      'factory-reset',
       'restart',
       'quit',
     ]) {
@@ -404,6 +739,9 @@ describe('Desktop startup recovery action parser', () => {
     expect(parseDesktopStartupRecoveryAction(
       'dsh-recovery://preview-uninstall?id=opaque-id_0001',
     )).toEqual({ action: 'preview-uninstall', id: 'opaque-id_0001' })
+    expect(parseDesktopStartupRecoveryAction(
+      'dsh-recovery://apply-data-directory?path=%2FVolumes%2FData%2FDSH',
+    )).toEqual({ action: 'apply-data-directory', path: '/Volumes/Data/DSH' })
     for (const action of ['preview-checkpoint', 'open-checkpoint']) {
       expect(parseDesktopStartupRecoveryAction(
         `dsh-recovery://${action}?id=slot-2`,
@@ -425,8 +763,162 @@ describe('Desktop startup recovery action parser', () => {
     'dsh-recovery://preview-uninstall?id=short',
     'dsh-recovery://preview-uninstall?id=opaque-id_0001&id=opaque-id_0002',
     'dsh-recovery://preview-uninstall?id=opaque-id_0001&extra=value',
+    'dsh-recovery://apply-data-directory',
+    'dsh-recovery://apply-data-directory?path=',
+    'dsh-recovery://restore-default-data-directory?path=%2Ftmp%2Funexpected',
+    'dsh-recovery://factory-reset?path=%2Ftmp%2Funexpected',
     `dsh-recovery://preview-uninstall?id=${'x'.repeat(161)}`,
+    `dsh-recovery://apply-data-directory?path=${'x'.repeat(32 * 1024 + 1)}`,
   ])('rejects invalid or over-privileged navigation: %s', href => {
     expect(parseDesktopStartupRecoveryAction(href)).toBeUndefined()
+  })
+})
+
+describe('Desktop startup recovery bundle selection', () => {
+  function windowFor(controller: Partial<DesktopStartupRecoveryController>) {
+    const recovery = new DesktopStartupRecoveryWindow({
+      controller: controller as DesktopStartupRecoveryController,
+      locale: 'en',
+      failureStage: 'profile-composition',
+      failureDetail: 'bundle selection test',
+      exportDiagnostics: async () => '/tmp/diagnostics.zip',
+    })
+    const parent = { isDestroyed: () => false, loadFile: vi.fn(async () => {}) }
+    ;(recovery as unknown as { window: typeof parent }).window = parent
+    return {
+      parent,
+      handle: (action: { readonly action: string; readonly id: string }) =>
+        (recovery as unknown as {
+          handleAction: (value: { readonly action: string; readonly id: string }) => Promise<void>
+        }).handleAction(action),
+    }
+  }
+
+  it('asks a question rather than a warning before disabling, then disables', async () => {
+    desktopDialog.show.mockClear()
+    const previewDisable = vi.fn(async () => ({
+      previewId: 'disable-preview-0001',
+      packageName: 'example-plugin',
+      expiresAt: '2026-08-25T00:05:00.000Z',
+    }))
+    const executeDisable = vi.fn(async () => ({ action: 'disable' as const, packageName: 'example-plugin' }))
+    const target = windowFor({
+      previewDisable,
+      executeDisable,
+      snapshot: vi.fn(async () => ({ profileName: 'desktop', bundles: [], checkpoints: [] })),
+    } as unknown as Partial<DesktopStartupRecoveryController>)
+
+    await target.handle({ action: 'preview-disable', id: 'bundle-selection-0001' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'question',
+      title: 'Disable this plugin?',
+      detail: expect.stringContaining('Nothing is deleted'),
+      buttons: ['Disable plugin', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+    }), target.parent)
+    expect(previewDisable).toHaveBeenCalledWith('bundle-selection-0001')
+    expect(executeDisable).toHaveBeenCalledWith('disable-preview-0001')
+  })
+
+  it('enables through the same confirmation shape', async () => {
+    desktopDialog.show.mockClear()
+    const executeEnable = vi.fn(async () => ({ action: 'enable' as const, packageName: 'example-plugin' }))
+    const target = windowFor({
+      previewEnable: vi.fn(async () => ({
+        previewId: 'enable-preview-0001',
+        packageName: 'example-plugin',
+        expiresAt: '2026-08-25T00:05:00.000Z',
+      })),
+      executeEnable,
+      snapshot: vi.fn(async () => ({ profileName: 'desktop', bundles: [], checkpoints: [] })),
+    } as unknown as Partial<DesktopStartupRecoveryController>)
+
+    await target.handle({ action: 'preview-enable', id: 'bundle-selection-0001' })
+
+    expect(desktopDialog.show).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'question',
+      title: 'Enable this plugin?',
+      buttons: ['Enable plugin', 'Cancel'],
+    }), target.parent)
+    expect(executeEnable).toHaveBeenCalledWith('enable-preview-0001')
+  })
+
+  it('changes nothing when the confirmation is cancelled', async () => {
+    desktopDialog.show.mockClear()
+    desktopDialog.show.mockResolvedValueOnce({ response: 1, checkboxChecked: false })
+    const executeDisable = vi.fn(async () => ({ action: 'disable' as const, packageName: 'example-plugin' }))
+    const target = windowFor({
+      previewDisable: vi.fn(async () => ({
+        previewId: 'disable-preview-0002',
+        packageName: 'example-plugin',
+        expiresAt: '2026-08-25T00:05:00.000Z',
+      })),
+      executeDisable,
+      snapshot: vi.fn(async () => ({ profileName: 'desktop', bundles: [], checkpoints: [] })),
+    } as unknown as Partial<DesktopStartupRecoveryController>)
+
+    await target.handle({ action: 'preview-disable', id: 'bundle-selection-0002' })
+    expect(executeDisable).not.toHaveBeenCalled()
+  })
+
+  it('names the bundle-selection stage when a disable fails', async () => {
+    desktopDialog.show.mockClear()
+    desktopDialog.showDetailed.mockClear()
+    const target = windowFor({
+      previewDisable: vi.fn(async () => ({
+        previewId: 'disable-preview-0003',
+        packageName: 'example-plugin',
+        expiresAt: '2026-08-25T00:05:00.000Z',
+      })),
+      executeDisable: vi.fn(async () => {
+        throw new DesktopStartupRecoveryControllerError(
+          'operation-failed',
+          'The Profile manifest could not be written.',
+          { operationStage: 'bundle-selection', diagnosticDetail: 'EPERM writing package.json' },
+        )
+      }),
+      snapshot: vi.fn(async () => ({ profileName: 'desktop', bundles: [], checkpoints: [] })),
+    } as unknown as Partial<DesktopStartupRecoveryController>)
+
+    await target.handle({ action: 'preview-disable', id: 'bundle-selection-0003' })
+
+    expect(desktopDialog.showDetailed).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      title: 'Could not change the plugin',
+      presentation: 'diagnostic',
+      detail: expect.stringContaining('Profile plugin selection'),
+    }), target.parent)
+  })
+
+  it('names the action stage when a non-controller failure carries no stage', async () => {
+    desktopDialog.show.mockClear()
+    desktopDialog.showDetailed.mockClear()
+    const target = windowFor({
+      previewEnable: vi.fn(async () => {
+        throw new Error('the recovery controller went away')
+      }),
+      snapshot: vi.fn(async () => ({ profileName: 'desktop', bundles: [], checkpoints: [] })),
+    } as unknown as Partial<DesktopStartupRecoveryController>)
+
+    await target.handle({ action: 'preview-enable', id: 'bundle-selection-0004' })
+
+    expect(desktopDialog.showDetailed).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'Could not change the plugin',
+      detail: expect.stringContaining('Profile plugin selection'),
+    }), target.parent)
+  })
+
+  it('accepts exactly the two new recovery actions with one opaque bundle id', () => {
+    for (const action of ['preview-disable', 'preview-enable']) {
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}?id=bundle_${'a'.repeat(32)}`))
+        .toEqual({ action, id: `bundle_${'a'.repeat(32)}` })
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}`)).toBeUndefined()
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}?id=short`)).toBeUndefined()
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}?id=a&id=b`)).toBeUndefined()
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}?id=ok_0001&extra=value`)).toBeUndefined()
+      expect(parseDesktopStartupRecoveryAction(`dsh-recovery://${action}?id=${'x'.repeat(161)}`)).toBeUndefined()
+    }
   })
 })

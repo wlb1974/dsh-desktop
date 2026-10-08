@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
-import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   DSH_1024STORE_ADAPTER_ID,
@@ -11,18 +10,12 @@ import {
   DSH_1024STORE_PROVIDER_ID,
 } from '../src/adapters/dsh-1024store.js'
 import {
-  DSH_MARKETPLACE_ADAPTER_ID,
-  DSH_MARKETPLACE_KEY,
-  DSH_MARKETPLACE_PROVIDER_ID,
-  DSH_MARKETPLACE_PUBLIC_ENDPOINT,
-} from '../src/adapters/dsh-marketplace.js'
-import {
   DSHFIND_ADAPTER_ID,
   DSHFIND_ENDPOINT,
   DSHFIND_KEY,
   DSHFIND_PROVIDER_ID,
 } from '../src/adapters/dshfind.js'
-import type { MarketSettingsDocument } from '../src/catalog/source-store.js'
+import { MemoryMarketStateStore, type MarketStateStore } from '../src/catalog/state-store.js'
 import type { CatalogSourceManifest, LocalSourceRecord } from '../src/contracts/index.js'
 import { marketRoutes, registerMarketRoutes } from '../src/host/routes.js'
 import { restrictedHttpClient } from '../src/network/restricted-http.js'
@@ -36,10 +29,7 @@ function fixture(path: string): unknown {
 interface MarketServer {
   readonly baseUrl: string
   readonly close: () => Promise<void>
-}
-
-interface SharedMarketSettings {
-  document: MarketSettingsDocument
+  readonly logger: { readonly error: ReturnType<typeof vi.fn> }
 }
 
 function localHeaders(server: MarketServer, origin = server.baseUrl): Record<string, string> {
@@ -105,16 +95,20 @@ const standardSource = (overrides: Partial<LocalSourceRecord> = {}): LocalSource
 
 async function startMarketServer(
   initialSources: readonly LocalSourceRecord[],
-  sharedSettings?: SharedMarketSettings,
+  sharedState?: MarketStateStore,
+  setCatalogCacheOverride?: MarketStateStore['setCatalogCache'],
 ): Promise<MarketServer> {
   const routes = new Map<string, RouteHandler>()
-  const settings = sharedSettings ?? { document: { sources: initialSources } }
-  const scope = {
-    get: () => settings.document,
-    update: async (patch: object) => {
-      settings.document = { ...settings.document, ...patch as Partial<MarketSettingsDocument> }
-    },
-  } as unknown as SettingsScope<MarketSettingsDocument>
+  const backing = sharedState ?? new MemoryMarketStateStore({ sources: initialSources })
+  const logger = { error: vi.fn() }
+  const state: MarketStateStore = setCatalogCacheOverride === undefined
+    ? backing
+    : {
+        getSources: () => backing.getSources(),
+        setSources: records => backing.setSources(records),
+        getCatalogCache: () => backing.getCatalogCache(),
+        setCatalogCache: setCatalogCacheOverride,
+      }
   const server = createServer((req, res) => {
     const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
     const handler = routes.get(pathname)
@@ -141,15 +135,16 @@ async function startMarketServer(
         return () => { routes.delete(route.path) }
       },
     },
-    logger: { error: vi.fn() },
+    logger,
   } as unknown as Context
-  const disposeRoutes = registerMarketRoutes(ctx, scope)
+  const disposeRoutes = registerMarketRoutes(ctx, state)
   return {
     baseUrl: `http://127.0.0.1:${String(port)}`,
     close: async () => {
       disposeRoutes()
       await closeServer(server)
     },
+    logger,
   }
 }
 
@@ -162,7 +157,7 @@ async function closeServer(server: Server): Promise<void> {
 describe('community market Host routes', () => {
   afterEach(() => { vi.restoreAllMocks() })
 
-  it('returns settings-backed source state with built-in provider metadata', async () => {
+  it('returns storage-backed source state with built-in provider metadata', async () => {
     const server = await startMarketServer([builtInSource()])
     try {
       const response = await readRoute(server, marketRoutes.state)
@@ -183,12 +178,6 @@ describe('community market Host routes', () => {
             key: DSH_1024STORE_KEY,
             providerId: DSH_1024STORE_PROVIDER_ID,
             partnership: true,
-          },
-          {
-            key: DSH_MARKETPLACE_KEY,
-            providerId: DSH_MARKETPLACE_PROVIDER_ID,
-            endpoint: DSH_MARKETPLACE_PUBLIC_ENDPOINT,
-            partnership: false,
           },
           {
             key: DSHFIND_KEY,
@@ -290,20 +279,20 @@ describe('community market Host routes', () => {
         signal.addEventListener('abort', () => reject(signal.reason), { once: true })
       })
     })
-    const settings: SharedMarketSettings = { document: { sources: [activeSource] } }
-    const first = await startMarketServer([], settings)
+    const shared = new MemoryMarketStateStore({ sources: [activeSource] })
+    const first = await startMarketServer([], shared)
     try {
       const firstResponse = await readRoute(
         first,
         `${marketRoutes.catalog}?sourceRecordId=${activeSource.sourceRecordId}&limit=50&locale=en`,
       )
       expect(firstResponse.status).toBe(200)
-      await vi.waitFor(() => expect(settings.document.catalogCache).toBeDefined())
+      await vi.waitFor(() => expect(shared.getCatalogCache()).toBeDefined())
     } finally {
       await first.close()
     }
 
-    const second = await startMarketServer([], settings)
+    const second = await startMarketServer([], shared)
     try {
       const startedAt = Date.now()
       const secondResponse = await readRoute(
@@ -333,9 +322,48 @@ describe('community market Host routes', () => {
     }
   })
 
+  it('keeps a successful catalog response when cache persistence fails', async () => {
+    const activeSource = standardSource({ enabled: true, order: 0 })
+    const providerPage = fixture('../docs/examples/catalog-provider-page.example.json') as {
+      readonly items: readonly unknown[]
+      readonly [key: string]: unknown
+    }
+    let requests = 0
+    const getJson = vi.spyOn(restrictedHttpClient, 'getJson').mockImplementation(async () => {
+      requests += 1
+      if (requests === 1) return { value: standardManifest, finalUrl: activeSource.manifestUrl! }
+      return {
+        value: { ...providerPage, page: { total: 1 } },
+        finalUrl: 'https://plugins.example.org/v1/plugins?limit=50',
+      }
+    })
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    const server = await startMarketServer(
+      [],
+      new MemoryMarketStateStore({ sources: [activeSource] }),
+      async () => { throw new Error('simulated storage write failure') },
+    )
+    try {
+      const response = await readRoute(
+        server,
+        `${marketRoutes.catalog}?sourceRecordId=${activeSource.sourceRecordId}&limit=50&locale=en`,
+      )
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        results: [{ snapshot: { items: [{ id: 'better-sidebar' }] } }],
+      })
+      await vi.waitFor(() => expect(server.logger.error).toHaveBeenCalled())
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      process.off('unhandledRejection', unhandled)
+      await server.close()
+      getJson.mockRestore()
+    }
+  })
+
   it.each([
     [DSH_1024STORE_KEY, DSH_1024STORE_ADAPTER_ID, DSH_1024STORE_PROVIDER_ID, 'DSH 1024Store'],
-    [DSH_MARKETPLACE_KEY, DSH_MARKETPLACE_ADAPTER_ID, DSH_MARKETPLACE_PROVIDER_ID, 'DSH Marketplace'],
     [DSHFIND_KEY, DSHFIND_ADAPTER_ID, DSHFIND_PROVIDER_ID, 'dshfind'],
   ] as const)('adds reviewed built-in provider %s as a disabled source', async (key, adapterId, providerId, name) => {
     const server = await startMarketServer([])
@@ -384,7 +412,7 @@ describe('community market Host routes', () => {
     }
   })
 
-  it('rejects an unknown built-in provider key without changing settings', async () => {
+  it('rejects an unknown built-in provider key without changing the registry', async () => {
     const server = await startMarketServer([])
     try {
       const response = await mutateSource(server, {
@@ -490,32 +518,7 @@ describe('community market Host routes', () => {
     }
   })
 
-  it('maps the reviewed DSH Marketplace endpoint URL to its built-in adapter', async () => {
-    const getJson = vi.spyOn(restrictedHttpClient, 'getJson')
-    const server = await startMarketServer([])
-    try {
-      const response = await mutateSource(server, {
-        action: 'add-standard',
-        manifestUrl: DSH_MARKETPLACE_PUBLIC_ENDPOINT,
-      })
-
-      expect(response.status).toBe(200)
-      await expect(response.json()).resolves.toMatchObject({
-        sources: [{
-          registrationKind: 'built-in',
-          adapterId: DSH_MARKETPLACE_ADAPTER_ID,
-          providerId: DSH_MARKETPLACE_PROVIDER_ID,
-          builtInProviderKey: DSH_MARKETPLACE_KEY,
-          enabled: false,
-        }],
-      })
-      expect(getJson).not.toHaveBeenCalled()
-    } finally {
-      await server.close()
-    }
-  })
-
-  it('rejects a cross-origin source mutation without changing settings', async () => {
+  it('rejects a cross-origin source mutation without changing the registry', async () => {
     const server = await startMarketServer([])
     try {
       const response = await mutateSource(server, {

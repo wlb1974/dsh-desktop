@@ -96,10 +96,22 @@ describe('ProfileCreateWindow', () => {
       webPreferences: expect.objectContaining({
         contextIsolation: true,
         nodeIntegration: false,
+        nodeIntegrationInSubFrames: false,
         sandbox: true,
         webSecurity: true,
+        webviewTag: false,
+        spellcheck: false,
+        partition: 'dsh-profile-create',
       }),
     }))
+    const webContents = electron.windows[0]!.webContents
+    const deny = webContents.setWindowOpenHandler?.mock.calls[0]?.[0] as (() => unknown) | undefined
+    expect(deny?.()).toEqual({ action: 'deny' })
+    const attach = webContents.on?.mock.calls
+      .find(([event]) => event === 'will-attach-webview')?.[1] as ((event: { preventDefault(): void }) => void) | undefined
+    const attachEvent = { preventDefault: vi.fn() }
+    attach?.(attachEvent)
+    expect(attachEvent.preventDefault).toHaveBeenCalledOnce()
     expect(electron.windows[0]?.options).not.toHaveProperty('modal')
     expect(electron.windows[0]?.options).not.toHaveProperty('parent')
   })
@@ -134,5 +146,51 @@ describe('ProfileCreateWindow', () => {
       })
     }
     expect(() => closed?.()).not.toThrow()
+  })
+
+  it('notifies cancellation exactly once for an explicit cancel followed by close', () => {
+    const onCancel = vi.fn()
+    const creator = new ProfileCreateWindow({ locale: 'en', onSubmit: async () => {}, onCancel })
+    creator.open()
+    const window = electron.windows[0]
+    const navigate = window?.webContents.on?.mock.calls
+      .find(([event]) => event === 'will-navigate')?.[1] as ((event: { preventDefault(): void }, href: string) => void) | undefined
+    const closed = window?.on.mock.calls.find(([event]) => event === 'closed')?.[1] as (() => void) | undefined
+
+    navigate?.({ preventDefault: vi.fn() }, 'dsh-profile-create://cancel')
+    closed?.()
+
+    expect(onCancel).toHaveBeenCalledOnce()
+    expect(window?.close).toHaveBeenCalledOnce()
+  })
+
+  it('notifies cancellation when the native window is closed', () => {
+    const onCancel = vi.fn()
+    const creator = new ProfileCreateWindow({ locale: 'en', onSubmit: async () => {}, onCancel })
+    creator.open()
+    const closed = electron.windows[0]?.on.mock.calls
+      .find(([event]) => event === 'closed')?.[1] as (() => void) | undefined
+
+    closed?.()
+
+    expect(onCancel).toHaveBeenCalledOnce()
+  })
+
+  it('does not report cancellation after a successful submission', async () => {
+    const onSubmit = vi.fn(async () => {})
+    const onCancel = vi.fn()
+    const creator = new ProfileCreateWindow({ locale: 'en', onSubmit, onCancel })
+    creator.open()
+    const window = electron.windows[0]
+    const navigate = window?.webContents.on?.mock.calls
+      .find(([event]) => event === 'will-navigate')?.[1] as ((event: { preventDefault(): void }, href: string) => void) | undefined
+    const closed = window?.on.mock.calls.find(([event]) => event === 'closed')?.[1] as (() => void) | undefined
+
+    navigate?.({ preventDefault: vi.fn() }, 'dsh-profile-create://submit?name=new-work')
+    await vi.waitFor(() => { expect(window?.close).toHaveBeenCalledOnce() })
+    closed?.()
+
+    expect(onSubmit).toHaveBeenCalledWith('new-work')
+    expect(onCancel).not.toHaveBeenCalled()
   })
 })

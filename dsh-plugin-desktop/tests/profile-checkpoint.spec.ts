@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -14,6 +15,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   DesktopProfileCheckpoint,
+  inspectLatestDesktopProfileCheckpointUsage,
   type ProfileCheckpointOptions,
 } from '../src/profile-checkpoint.ts'
 
@@ -43,10 +45,12 @@ function fixture(options: Partial<ProfileCheckpointOptions> = {}): {
     userDataDir: userData,
     profileDir: profile,
     homeDir: home,
-    profileIdentity: 'profile-identity',
     profileName: 'work',
     provider: 'dsh-market',
     appVersion: '2.0.3',
+    desktopPackageName: 'dsh-plugin-desktop',
+    releaseChannel: 'stable',
+    dshVersion: '0.1.1-rc.2',
     ...options,
   })
   return { root, home, profile, userData, checkpoint }
@@ -68,11 +72,14 @@ describe('Desktop profile health checkpoints', () => {
       status: 'captured',
       slotId: 'slot-1',
       manifest: {
-        version: 3,
+        version: 4,
         capturedAt: '2026-08-25T01:02:03.000Z',
         profileName: 'work',
         provider: 'dsh-market',
         appVersion: '2.0.3',
+        desktopPackageName: 'dsh-plugin-desktop',
+        releaseChannel: 'stable',
+        dshVersion: '0.1.1-rc.2',
         reason: 'healthy-startup',
       },
     })
@@ -203,6 +210,108 @@ describe('Desktop profile health checkpoints', () => {
     expect(readFileSync(join(target.home, 'settings.yaml'), 'utf8')).toBe('new global settings\n')
   })
 
+  it('inspects only the newest V4 manifest without changing checkpoint state', () => {
+    let now = Date.parse('2026-08-25T00:00:00.000Z')
+    const target = fixture({ now: () => now })
+    target.checkpoint.captureHealthy()
+    now += 1_000
+    target.checkpoint.captureHealthy()
+    const checkpointRoot = join(target.userData, 'health-snapshots')
+    const beforeEntries = readdirSync(checkpointRoot, { recursive: true }).map(String).sort()
+    const beforeManifests = target.checkpoint.listSlots()
+      .filter(slot => slot.snapshotExists)
+      .map(slot => readFileSync(join(slot.snapshotDirectory, 'manifest.json'), 'utf8'))
+
+    expect(inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: target.userData,
+      profileDir: target.profile,
+      profileName: 'work',
+      legacyDesktopPackageName: 'dsh-plugin-desktop',
+      legacyReleaseChannel: 'stable',
+    })).toEqual({
+      status: 'valid',
+      evidence: {
+        source: 'checkpoint',
+        recordedAt: '2026-08-25T00:00:01.000Z',
+        desktopPackageName: 'dsh-plugin-desktop',
+        releaseChannel: 'stable',
+        desktopVersion: '2.0.3',
+        dshVersion: '0.1.1-rc.2',
+      },
+    })
+    expect(readdirSync(checkpointRoot, { recursive: true }).map(String).sort()).toEqual(beforeEntries)
+    expect(target.checkpoint.listSlots()
+      .filter(slot => slot.snapshotExists)
+      .map(slot => readFileSync(join(slot.snapshotDirectory, 'manifest.json'), 'utf8')))
+      .toEqual(beforeManifests)
+  })
+
+  it('infers V2/V3 ownership from userData and rejects damaged evidence', () => {
+    const target = fixture()
+    const captured = target.checkpoint.captureHealthy()
+    if (captured.status !== 'captured') throw new Error('expected a captured checkpoint')
+    const manifestPath = join(captured.snapshotDirectory, 'manifest.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+    const v3 = { ...manifest }
+    delete v3.desktopPackageName
+    delete v3.releaseChannel
+    delete v3.dshVersion
+    writeFileSync(manifestPath, `${JSON.stringify({ ...v3, version: 3 })}\n`)
+
+    expect(inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: target.userData,
+      profileDir: target.profile,
+      profileName: 'work',
+      legacyDesktopPackageName: 'dsh-plugin-desktop-beta',
+      legacyReleaseChannel: 'beta',
+    })).toMatchObject({
+      status: 'valid',
+      evidence: {
+        desktopPackageName: 'dsh-plugin-desktop-beta',
+        releaseChannel: 'beta',
+        desktopVersion: '2.0.3',
+      },
+    })
+
+    writeFileSync(manifestPath, `${JSON.stringify({
+      ...v3,
+      version: 2,
+      files: (v3.files as Array<{ name: string }>).filter(file => !file.name.startsWith('home/')),
+    })}\n`)
+    expect(inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: target.userData,
+      profileDir: target.profile,
+      profileName: 'work',
+      legacyDesktopPackageName: 'dsh-plugin-desktop-beta',
+      legacyReleaseChannel: 'beta',
+    })).toMatchObject({
+      status: 'valid',
+      evidence: { releaseChannel: 'beta', desktopVersion: '2.0.3' },
+    })
+
+    writeFileSync(manifestPath, '{broken')
+    expect(inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: target.userData,
+      profileDir: target.profile,
+      profileName: 'work',
+      legacyDesktopPackageName: 'dsh-plugin-desktop-beta',
+      legacyReleaseChannel: 'beta',
+    })).toMatchObject({ status: 'invalid' })
+  })
+
+  it('does not create a missing userData directory while inspecting', () => {
+    const target = fixture()
+    const missing = join(target.root, 'missing-user-data')
+    expect(inspectLatestDesktopProfileCheckpointUsage({
+      userDataDir: missing,
+      profileDir: target.profile,
+      profileName: 'work',
+      legacyDesktopPackageName: 'dsh-plugin-desktop-beta',
+      legacyReleaseChannel: 'beta',
+    })).toEqual({ status: 'none' })
+    expect(existsSync(missing)).toBe(false)
+  })
+
   it('keeps the post-restore skip marker until a healthy capture actually occurs', () => {
     const target = fixture()
     target.checkpoint.captureHealthy()
@@ -242,10 +351,12 @@ describe('Desktop profile health checkpoints', () => {
       userDataDir: target.userData,
       profileDir: target.profile,
       homeDir: target.home,
-      profileIdentity: 'profile-identity',
       profileName: 'work',
       provider: 'other-market',
       appVersion: '2.0.3',
+      desktopPackageName: 'dsh-plugin-desktop',
+      releaseChannel: 'stable',
+      dshVersion: '0.1.1-rc.2',
     })
     expect(reopened.listSlots()[0]).toMatchObject({
       snapshotExists: true,

@@ -7,7 +7,12 @@ const OWNER_PATTERN = /^[a-z0-9][a-z0-9-]{0,99}$/iu
 const REPOSITORY_PATTERN = /^[a-z0-9._-]{1,100}$/iu
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/u
 const MAX_MANIFEST_BYTES = 1024 * 1024
-const BLOCKED_PACKAGES = new Set(['dsh-plugin-desktop', 'dsh-community-market'])
+const BLOCKED_PACKAGES = new Set([
+  'dsh-plugin-desktop',
+  'dsh-plugin-desktop-beta',
+  'dsh-desktop-next',
+  'dsh-community-market',
+])
 
 export interface GitHubPackageVerification {
   readonly packageName: string

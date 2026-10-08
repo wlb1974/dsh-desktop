@@ -2,8 +2,6 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { BlockList, isIP } from 'node:net'
 import type { Context } from '@deepseek-ai/cordis'
-import z from '@deepseek-ai/schemastery'
-import { settingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { CatalogSourceManifest } from '../contracts/index.js'
 import { parseCatalogSnapshot, parseCatalogSource, validateLocalSourceRecords } from '../contracts/validate.js'
 import type { CatalogHttpClient } from '../contracts/types.js'
@@ -31,48 +29,16 @@ import {
   DSH_1024STORE_LEGACY_ADAPTER_ID,
   isDsh1024StoreAdapterId,
 } from '../adapters/dsh-1024store.js'
-import {
-  DSH_MARKETPLACE_ADAPTER_ID,
-  DSH_MARKETPLACE_HOSTNAME,
-  DSH_MARKETPLACE_KEY,
-  isDshMarketplaceSourceUrl,
-} from '../adapters/dsh-marketplace.js'
 import { DSHFIND_ADAPTER_ID, DSHFIND_HOSTNAME } from '../adapters/dshfind.js'
 import { assertStandardSourceTrustRoot } from '../adapters/standard-http.js'
 import { BUILT_IN_PROVIDERS, DefaultCatalogService, type CatalogFetchScope, type CatalogFullIndex } from '../catalog/service.js'
-import { SettingsCatalogSourceStore, type MarketCatalogCache, type MarketSettingsDocument } from '../catalog/source-store.js'
+import { PersistentCatalogSourceStore } from '../catalog/source-store.js'
+import type { MarketCatalogCache, MarketStateStore } from '../catalog/state-store.js'
 import { MARKET_MEDIA_ASSET_REF_PATTERN } from '../media/ref.js'
 import { createRestrictedImageFetcher } from '../media/restricted-image.js'
 import { createMarketMediaService } from '../media/service.js'
 import { MarketInstallError, type MarketInstallService } from '../install/service.js'
 import { manualInstallHints } from '../install/manual.js'
-
-export const MARKET_SETTINGS_NAMESPACE = settingsNamespace('dsh-community-market')
-const SOURCE_SCHEMA = z.object({
-  sourceRecordId: z.string().required(),
-  registrationKind: z.union(['user-added', 'built-in'] as const).required(),
-  adapterId: z.string().required(),
-  providerId: z.string().required(),
-  manifestUrl: z.string(),
-  manifest: z.any(),
-  builtInProviderKey: z.string(),
-  enabled: z.boolean().required(),
-  order: z.number().required(),
-})
-const SETTINGS_SCHEMA = z.object({
-  sources: z.array(SOURCE_SCHEMA).default([]),
-  catalogCache: z.object({
-    version: z.number().step(1),
-    sourceRecordId: z.string(),
-    locale: z.string(),
-    savedAt: z.string(),
-    snapshot: z.any(),
-    categories: z.array(z.string()),
-    scannedAt: z.string(),
-    expiresAt: z.string(),
-    providerRevision: z.string(),
-  }).default(undefined as never),
-}) as unknown as z<MarketSettingsDocument>
 
 const ROUTE_STATE = '/api/community-market/state'
 const ROUTE_SOURCES = '/api/community-market/sources'
@@ -104,12 +70,6 @@ const dshfindHttpClient = createCachedCatalogHttpClient(
     // source hostnames must never inherit this local-proxy exception.
     syntheticProxyHostnames: [DSHFIND_HOSTNAME],
     maxBodyBytes: MAX_DSHFIND_BODY_BYTES,
-  }),
-)
-
-const dshMarketplaceHttpClient = createCachedCatalogHttpClient(
-  createRestrictedHttpClient({
-    syntheticProxyHostnames: [DSH_MARKETPLACE_HOSTNAME],
   }),
 )
 
@@ -486,7 +446,7 @@ export interface MarketInstallServiceProvider {
 }
 
 export interface MarketDesktopActions {
-  openTerminal(): void
+  openTerminal?(): void
   requestRestart(): Promise<void>
 }
 
@@ -560,7 +520,7 @@ export async function readStandardSourceManifest(
 }
 
 async function mutateSources(
-  scope: SettingsScope<MarketSettingsDocument>,
+  state: MarketStateStore,
   mutation: MarketSourceMutation,
   signal: AbortSignal,
   onUnavailable?: (sourceRecordId: string) => void,
@@ -570,15 +530,11 @@ async function mutateSources(
   ) => Promise<CatalogSourceManifest> = readStandardSourceManifest,
 ): Promise<void> {
   signal.throwIfAborted()
-  const store = new SettingsCatalogSourceStore(scope)
+  const store = new PersistentCatalogSourceStore(state)
   const records = [...await store.load()]
   const unavailableSourceRecordIds = new Set<string>()
   const nextOrder = records.reduce((maximum, record) => Math.max(maximum, record.order), -1) + 1
-  const builtInKey = mutation.action === 'add-builtin'
-    ? mutation.key
-    : mutation.action === 'add-standard' && isDshMarketplaceSourceUrl(mutation.manifestUrl)
-      ? DSH_MARKETPLACE_KEY
-      : undefined
+  const builtInKey = mutation.action === 'add-builtin' ? mutation.key : undefined
   if (builtInKey !== undefined) {
     const provider = BUILT_IN_PROVIDERS.find(candidate => candidate.key === builtInKey)
     if (provider === undefined) throw new Error('built-in source unavailable')
@@ -643,7 +599,7 @@ async function mutateSources(
 }
 
 export function createMarketSourceMutator(
-  scope: SettingsScope<MarketSettingsDocument>,
+  state: MarketStateStore,
   onUnavailable?: (sourceRecordId: string) => void,
   readManifest?: (manifestUrl: string, signal: AbortSignal) => Promise<CatalogSourceManifest>,
 ): (
@@ -654,7 +610,7 @@ export function createMarketSourceMutator(
   return (mutation, signal) => {
     const pending = tail.then(async () => {
       signal.throwIfAborted()
-      await mutateSources(scope, mutation, signal, onUnavailable, readManifest)
+      await mutateSources(state, mutation, signal, onUnavailable, readManifest)
     })
     tail = pending.catch(() => {})
     return pending
@@ -663,20 +619,19 @@ export function createMarketSourceMutator(
 
 export function registerMarketRoutes(
   ctx: Context,
-  scope: SettingsScope<MarketSettingsDocument>,
+  state: MarketStateStore,
   installProvider?: MarketInstallServiceProvider,
   desktopActionsProvider?: MarketDesktopActionsProvider,
   desktopPluginsProvider?: MarketDesktopPluginsProvider,
 ): () => void {
   const expectedPort = ctx.webServer.port
   const generationController = new AbortController()
-  const store = new SettingsCatalogSourceStore(scope)
+  const store = new PersistentCatalogSourceStore(state)
   const media = createMarketMediaService({
     fetchImage: createRestrictedImageFetcher({
       // These are compiled-in adapter hosts, not names supplied by a remote source.
       syntheticProxyHostnames: [
         DSH_1024STORE_HOSTNAME,
-        DSH_MARKETPLACE_HOSTNAME,
         'github.com',
         'avatars.githubusercontent.com',
       ],
@@ -686,7 +641,6 @@ export function registerMarketRoutes(
     adapterHttpClients: new Map([
       [DSH_1024STORE_ADAPTER_ID, dsh1024StoreHttpClient],
       [DSH_1024STORE_LEGACY_ADAPTER_ID, dsh1024StoreHttpClient],
-      [DSH_MARKETPLACE_ADAPTER_ID, dshMarketplaceHttpClient],
       [DSHFIND_ADAPTER_ID, dshfindHttpClient],
     ]),
     media,
@@ -694,7 +648,7 @@ export function registerMarketRoutes(
   })
   const servedCatalogPreviews = new Set<string>()
   const catalogPreviewKey = (sourceRecordId: string, locale: string) => `${sourceRecordId}\0${locale}`
-  const mutateSource = createMarketSourceMutator(scope, sourceRecordId => {
+  const mutateSource = createMarketSourceMutator(state, sourceRecordId => {
     service.invalidateSource(sourceRecordId)
     for (const key of servedCatalogPreviews) {
       if (key.startsWith(`${sourceRecordId}\0`)) servedCatalogPreviews.delete(key)
@@ -729,9 +683,17 @@ export function registerMarketRoutes(
     locale: string,
   ): Promise<void> => {
     const cache = catalogCacheFromResponse(response, sourceRecordId, locale)
-    if (cache !== undefined) await scope.update({ catalogCache: cache })
+    if (cache === undefined) return
+    try {
+      await state.setCatalogCache(cache)
+    } catch (cause) {
+      // Catalog browsing already succeeded; a failed cache write must not
+      // escalate into an unhandled rejection that terminates the host.
+      ctx.logger.error(`dsh-community-market: failed to persist the catalog cache: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`)
+    }
   }
-  const settingsScope = scope
   const routes = [
     ctx.webServer.register({ kind: 'exact', path: ROUTE_STATE, handler: async (_req, res) => {
       if (generationController.signal.aborted) return
@@ -745,7 +707,7 @@ export function registerMarketRoutes(
           sources: await service.listSources(),
           builtIns: viewBuiltIns(),
           desktopActions: {
-            openTerminal: desktopActions !== undefined,
+            openTerminal: typeof desktopActions?.openTerminal === 'function',
             requestRestart: desktopActions !== undefined
               && installProvider?.get() !== undefined,
           },
@@ -803,7 +765,6 @@ export function registerMarketRoutes(
           throw new Error('catalog source is not active')
         }
         const providerQuery = activeSource?.adapterId === DSHFIND_ADAPTER_ID
-          || (activeSource?.adapterId === DSH_MARKETPLACE_ADAPTER_ID && categories.length <= 1)
           || isDsh1024StoreAdapterId(activeSource?.adapterId)
         if (providerQuery) {
           let results: readonly MarketCatalogSourceResult[]
@@ -851,7 +812,7 @@ export function registerMarketRoutes(
         if (!force && previewKey !== undefined && !servedCatalogPreviews.has(previewKey)) {
           const cached = activeSource === undefined
             ? undefined
-            : cachedCatalogResponse(settingsScope.get().catalogCache, activeSource, localeKey)
+            : cachedCatalogResponse(state.getCatalogCache(), activeSource, localeKey)
           if (cached !== undefined) {
             servedCatalogPreviews.add(previewKey)
             if (!signal.aborted && !res.destroyed) sendJson(res, 200, cached)
@@ -962,7 +923,7 @@ export function registerMarketRoutes(
           return
         }
         const actions = desktopActionsProvider.get()
-        if (actions === undefined) {
+        if (actions?.openTerminal === undefined) {
           sendJson(res, 503, { error: 'desktop actions are unavailable' })
           return
         }
@@ -1034,7 +995,6 @@ export function registerMarketRoutes(
             ...(cursors[0] === undefined ? {} : { cursor: cursors[0] }),
           }
           const providerQuery = activeSource.adapterId === DSHFIND_ADAPTER_ID
-            || (activeSource.adapterId === DSH_MARKETPLACE_ADAPTER_ID && categories.length <= 1)
             || isDsh1024StoreAdapterId(activeSource.adapterId)
           let results: readonly MarketCatalogSourceResult[]
           let metadata: MarketCatalogMetadata | undefined
@@ -1192,10 +1152,6 @@ export function registerMarketRoutes(
     media.dispose()
     routes.forEach(dispose => dispose())
   }
-}
-
-export function registerMarketSettings(ctx: Context): SettingsScope<MarketSettingsDocument> {
-  return ctx.settings.register(MARKET_SETTINGS_NAMESPACE, SETTINGS_SCHEMA, { applies: 'live' })
 }
 
 export const marketRoutes = {

@@ -1,4 +1,4 @@
-/** Physical-path helpers for dependencies Electron Builder removes from app.asar. */
+/** Logical and physical path helpers for Electron's packaged runtime. */
 
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -46,7 +46,11 @@ export function unpackedAsarPath(filename: string): string {
  * Resolve one dependency entry from a built desktop module.
  * @param moduleUrl - URL of a module emitted below the package's `lib` directory.
  * @param dependencyEntry - package subpath resolved through Node module lookup.
- * @returns a physical path suitable for Node execution and profile symlinks.
+ * @returns the logical module path, including app.asar in packaged Electron.
+ *
+ * Electron's patched Node loader can execute JavaScript from this path under
+ * ELECTRON_RUN_AS_NODE. Call {@link unpackedAsarPath} only for a native binary
+ * passed directly to the operating system (spawn cannot enter an ASAR archive).
  */
 export function packagedDependencyPath(moduleUrl: string, dependencyEntry: string): string {
   const segments = dependencyEntry.split('/')
@@ -59,9 +63,8 @@ export function packagedDependencyPath(moduleUrl: string, dependencyEntry: strin
   }
   const packageSegments = segments[0]?.startsWith('@') === true ? 2 : 1
   const packageName = segments.slice(0, packageSegments).join('/')
-  const logicalPath = join(
+  return join(
     resolvePackageRoot(moduleUrl, packageName),
     ...segments.slice(packageSegments),
   )
-  return unpackedAsarPath(logicalPath)
 }

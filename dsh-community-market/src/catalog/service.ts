@@ -13,13 +13,6 @@ import {
   dsh1024StoreAdapter,
   isDsh1024StoreAdapterId,
 } from '../adapters/dsh-1024store.js'
-import {
-  DSH_MARKETPLACE_ADAPTER_ID,
-  DSH_MARKETPLACE_KEY,
-  DSH_MARKETPLACE_PROVIDER_ID,
-  DSH_MARKETPLACE_PUBLIC_ENDPOINT,
-  dshMarketplaceAdapter,
-} from '../adapters/dsh-marketplace.js'
 import { DSHFIND_ADAPTER_ID, DSHFIND_ENDPOINT, DSHFIND_KEY, DSHFIND_PROVIDER_ID, dshfindAdapter } from '../adapters/dshfind.js'
 import { standardHttpAdapter } from '../adapters/standard-http.js'
 
@@ -54,20 +47,6 @@ export const BUILT_IN_PROVIDERS: readonly BuiltInProviderDefinition[] = [
     partnership: true,
   },
   {
-    key: DSH_MARKETPLACE_KEY,
-    name: 'DSH Marketplace',
-    description: '第三方社区目录，通过内置兼容适配器只读接入。目录收录不代表插件经过审核或推荐。',
-    providerId: DSH_MARKETPLACE_PROVIDER_ID,
-    adapterId: DSH_MARKETPLACE_ADAPTER_ID,
-    endpoint: DSH_MARKETPLACE_PUBLIC_ENDPOINT,
-    attribution: {
-      name: 'DSH Marketplace',
-      url: 'https://dsh-marketplace.qilewl.net',
-      notice: 'Third-party community catalog connected through a reviewed compatibility adapter.',
-    },
-    partnership: false,
-  },
-  {
     key: DSHFIND_KEY,
     name: 'dshfind',
     description: '合作提供方目录。需要用户明确添加并启用。目录收录不代表插件经过审核或推荐。',
@@ -87,7 +66,6 @@ const adapters = new Map<string, CatalogAdapter>([
   [standardHttpAdapter.adapterId, standardHttpAdapter],
   [dsh1024StoreAdapter.adapterId, dsh1024StoreAdapter],
   [DSH_1024STORE_LEGACY_ADAPTER_ID, dsh1024StoreAdapter],
-  [dshMarketplaceAdapter.adapterId, dshMarketplaceAdapter],
   [dshfindAdapter.adapterId, dshfindAdapter],
 ])
 
@@ -398,6 +376,7 @@ export class DefaultCatalogService implements CatalogService {
   private readonly catalogScanGates = new Map<string, ConcurrencyGate>()
   private readonly cursorTtlMs: number
   private readonly maxCursorEntries: number
+  private readonly maxScanCacheEntries: number
   private readonly catalogScanCacheTtlMs: number
   private readonly sourceConcurrency: ConcurrencyGate
   private readonly now: () => number
@@ -415,6 +394,7 @@ export class DefaultCatalogService implements CatalogService {
     this.catalogScanCacheTtlMs = options.catalogScanCacheTtlMs ?? options.cacheTtlMs ?? DEFAULT_CATALOG_SCAN_CACHE_TTL_MS
     const maxConcurrentSources = options.maxConcurrentSources ?? 4
     const maxCacheEntries = options.maxCacheEntries ?? 256
+    this.maxScanCacheEntries = maxCacheEntries
     if (!Number.isSafeInteger(maxCacheEntries) || maxCacheEntries < 1) {
       throw new TypeError('invalid catalog cache entry limit')
     }
@@ -613,6 +593,41 @@ export class DefaultCatalogService implements CatalogService {
     })
   }
 
+  /**
+   * Drop the least recently inserted scan indexes until the cache is back
+   * within bounds. Generation counters are kept: they are one number per
+   * (source, locale) key, and deleting one that a queued or running scan
+   * still compares against would make that scan fail its re-validation with
+   * a misleading "source changed" error. Idle gate and controller sets are
+   * reclaimed; gates for keys with active scans are left alone because the
+   * scan flow always removes the cache entry before entering its gate, so an
+   * evicted key cannot have an active scan.
+   */
+  private evictCatalogScanCache(): void {
+    for (const [key, entry] of this.catalogScanCache) {
+      if (this.catalogScanCache.size <= this.maxScanCacheEntries) return
+      this.catalogScanCache.delete(key)
+      // Paging cursors were validated against the evicted scan's source
+      // generation, and eviction keeps the generation counter (a forced
+      // refresh would bump it). A rebuilt catalog can therefore differ in
+      // content while an old cursor still validates, silently paging across
+      // the rebuild boundary. Revoking the source's cursors trades a
+      // client-visible pagination restart for cross-version correctness.
+      this.revokeSourceCursors(entry.sourceRecordId)
+      const controllers = this.catalogScanControllers.get(key)
+      if (controllers === undefined || controllers.size === 0) {
+        this.catalogScanControllers.delete(key)
+      }
+      // The gate is kept: a request can already hold it while queued for the
+      // global source-concurrency permit, with no controller registered yet.
+      // Deleting the gate here would let the next request create a second
+      // gate and run two rebuilds of the same catalog concurrently, the
+      // later-arriving older result overwriting the newer one. Idle gate
+      // objects are a few dozen bytes per (source, locale) key, the same
+      // standing cost as the retained generation counters.
+    }
+  }
+
   async scanCatalog(
     signal: AbortSignal,
     options: CatalogScanOptions = {},
@@ -663,7 +678,12 @@ export class DefaultCatalogService implements CatalogService {
       && cached.sourceGeneration === sourceGeneration
       && cached.scanGeneration === scanGeneration
       && this.now() < cached.expiresAt
-    ) return cachedScanView(cached, 'cached')
+    ) {
+      // Refresh insertion order so eviction removes the least recently used scan.
+      this.catalogScanCache.delete(key)
+      this.catalogScanCache.set(key, cached)
+      return cachedScanView(cached, 'cached')
+    }
     if (cached !== undefined) {
       if (this.now() >= cached.expiresAt) this.revokeSourceCursors(source.sourceRecordId)
       this.catalogScanCache.delete(key)
@@ -750,6 +770,7 @@ export class DefaultCatalogService implements CatalogService {
           scanKey: randomUUID(),
         }
         this.catalogScanCache.set(key, entry)
+        this.evictCatalogScanCache()
         for (const snapshot of entry.snapshots) {
           try { this.observeSnapshot?.(snapshot) } catch { /* installation is optional; catalog browsing remains available */ }
         }
